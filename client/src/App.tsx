@@ -23,7 +23,17 @@ interface Message {
   fileUrl?: string | null;
   fileName?: string | null;
   fileSize?: string | null;
+  isSecure?: boolean;
+  secureConsumed?: boolean;
   timestamp: string;
+}
+
+interface SecureKeyStatus {
+  configured: boolean;
+  ready: boolean;
+  setByMe: boolean;
+  confirmedByMe: boolean;
+  salt: string | null;
 }
 
 interface FriendRequestItem {
@@ -74,23 +84,62 @@ const EMOJI_LIST = [
   '☕', '💻', '🍕', '⭐', '🎈', '👋', '💯'
 ];
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
+async function deriveSecureMessageKey(secret: string, saltBase64: string): Promise<CryptoKey> {
+  const material = await crypto.subtle.importKey(
+    'raw',
+    toArrayBuffer(new TextEncoder().encode(secret)),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: toArrayBuffer(base64ToBytes(saltBase64)),
+      iterations: 310_000,
+      hash: 'SHA-256',
+    },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+function secureMessageAad(userId1: string, userId2: string): ArrayBuffer {
+  return toArrayBuffer(
+    new TextEncoder().encode(`chatvia-secure-v1:${[userId1, userId2].sort().join(':')}`)
+  );
+}
+
 interface ChatViewPanelProps {
   currentUser: User;
+  accessToken: string;
   onLogout?: () => void;
-  paneTitle?: string;
-  forcedActiveUserId?: string;
-  onToggleSplit?: () => void;
-  isSplitActive?: boolean;
   onUserUpdate?: (updatedUser: User) => void;
 }
 
 function ChatViewPanel({
   currentUser,
+  accessToken,
   onLogout,
-  paneTitle,
-  forcedActiveUserId,
-  onToggleSplit,
-  isSplitActive,
   onUserUpdate,
 }: ChatViewPanelProps) {
   const [activeTab, setActiveTab] = useState<'chats' | 'friends' | 'profile'>('chats');
@@ -103,6 +152,8 @@ function ChatViewPanel({
 
   // Active chat
   const [activeContact, setActiveContact] = useState<User | null>(null);
+  const activeContactId = activeContact?.id;
+  const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [messageAllowed, setMessageAllowed] = useState(true);
 
@@ -123,6 +174,17 @@ function ChatViewPanel({
   // Emoji & Uploads
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const [secureMode, setSecureMode] = useState(false);
+  const [securePassphrase, setSecurePassphrase] = useState('');
+  const [secureKeyStatus, setSecureKeyStatus] = useState<SecureKeyStatus | null>(null);
+  const [secureKeyRefresh, setSecureKeyRefresh] = useState(0);
+  const [secureKeyError, setSecureKeyError] = useState('');
+  const [secureImage, setSecureImage] = useState<File | null>(null);
+  const [secureImageUrls, setSecureImageUrls] = useState<Record<string, string>>({});
+  const [revealedSecureMessages, setRevealedSecureMessages] = useState<Record<string, string>>({});
+  const [secureProcessingId, setSecureProcessingId] = useState<string | null>(null);
+  const secureImageInputRef = useRef<HTMLInputElement | null>(null);
 
   // Typing
   const [otherIsTyping, setOtherIsTyping] = useState(false);
@@ -132,6 +194,16 @@ function ChatViewPanel({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleSelectContact = (contact: User) => {
+    setSecurePassphrase('');
+    setSecureImage(null);
+    setSecureKeyStatus(null);
+    setSecureKeyError('');
+    if (secureImageInputRef.current) secureImageInputRef.current.value = '';
+    setActiveContact(contact);
+    setMobileChatOpen(true);
+  };
 
   const toggleTheme = () => {
     const nextTheme = theme === 'light' ? 'dark' : 'light';
@@ -158,12 +230,7 @@ function ChatViewPanel({
         setPendingOutgoing(data.pendingOutgoing || []);
 
         if (!activeContact && data.friends && data.friends.length > 0) {
-          if (forcedActiveUserId) {
-            const found = data.friends.find((f: User) => f.id === forcedActiveUserId);
-            setActiveContact(found || data.friends[0]);
-          } else {
-            setActiveContact(data.friends[0]);
-          }
+          setActiveContact(data.friends[0]);
         }
       }
     } catch (err) {
@@ -177,14 +244,14 @@ function ChatViewPanel({
 
   // Load conversation messages
   useEffect(() => {
-    if (!activeContact) {
+    if (!activeContactId) {
       setMessages([]);
       return;
     }
 
     const fetchMessages = async () => {
       try {
-        const res = await fetch(`/api/messages?user1=${currentUser.id}&user2=${activeContact.id}`);
+        const res = await fetch(`/api/messages?user1=${currentUser.id}&user2=${activeContactId}`);
         const data = await res.json();
         if (res.ok && data.allowed) {
           setMessages(data.messages || []);
@@ -200,16 +267,81 @@ function ChatViewPanel({
 
     fetchMessages();
     setOtherIsTyping(false);
-  }, [activeContact?.id, currentUser.id]);
+  }, [activeContactId, currentUser.id]);
+
+  useEffect(() => {
+    if (!activeContactId) return;
+
+    const controller = new AbortController();
+    fetch(`/api/friends/${encodeURIComponent(activeContactId)}/secure-key`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: controller.signal,
+    })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not load shared key status.');
+        setSecureKeyStatus(data);
+        setSecureKeyError('');
+      })
+      .catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        console.error('Secure key status error:', err);
+        setSecureKeyError(err instanceof Error ? err.message : 'Could not load shared key status.');
+      });
+
+    return () => controller.abort();
+  }, [activeContactId, accessToken, secureKeyRefresh]);
+
+  useEffect(() => {
+    if (!activeContactId) return;
+    const pollId = window.setInterval(
+      () => setSecureKeyRefresh((refresh) => refresh + 1),
+      5000
+    );
+    return () => window.clearInterval(pollId);
+  }, [activeContactId]);
+
+  useEffect(() => {
+    let active = true;
+    const objectUrls: string[] = [];
+    const secureMessages = messages.filter((message) => message.isSecure);
+    Promise.all(
+      secureMessages.map(async (message) => {
+        const res = await fetch(`/api/secure/messages/${encodeURIComponent(message.id)}/image`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+          cache: 'no-store',
+        });
+        if (!res.ok) throw new Error(`Could not load secure image ${message.id}.`);
+        return [message.id, URL.createObjectURL(await res.blob())] as const;
+      })
+    )
+      .then((entries) => {
+        if (!active) {
+          entries.forEach(([, url]) => URL.revokeObjectURL(url));
+          return;
+        }
+        objectUrls.push(...entries.map(([, url]) => url));
+        setSecureImageUrls(Object.fromEntries(entries));
+      })
+      .catch((err: unknown) => console.error('Secure image load error:', err));
+
+    return () => {
+      active = false;
+      objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [messages, accessToken]);
 
   // WebSocket lifecycle
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ws?userId=${encodeURIComponent(currentUser.id)}`;
+    const wsUrl = `${protocol}//${host}/ws`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'authenticate', token: accessToken }));
+    };
 
     ws.onmessage = (event) => {
       try {
@@ -264,7 +396,7 @@ function ChatViewPanel({
     return () => {
       ws.close();
     };
-  }, [currentUser.id, activeContact?.id]);
+  }, [currentUser.id, accessToken, activeContact?.id]);
 
   // Lookup User by User ID ("do not shows the user name until they enter the user id")
   const handleLookupUserId = async (e: React.FormEvent) => {
@@ -379,7 +511,9 @@ function ChatViewPanel({
     if (!file || !activeContact || !messageAllowed) return;
 
     setUploading(true);
+    setUploadError('');
     const formData = new FormData();
+    formData.append('userId', currentUser.id);
     formData.append('file', file);
 
     try {
@@ -389,41 +523,250 @@ function ChatViewPanel({
       });
 
       const uploadData = await res.json();
-      if (res.ok) {
-        // Send message with file
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: 'send_message',
-              receiverId: activeContact.id,
-              content: uploadData.messageType === 'image' ? 'Photo' : uploadData.fileName,
-              messageType: uploadData.messageType,
-              fileUrl: uploadData.fileUrl,
-              fileName: uploadData.fileName,
-              fileSize: uploadData.fileSize,
-            })
-          );
-        } else {
-          await fetch('/api/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              senderId: currentUser.id,
-              receiverId: activeContact.id,
-              content: uploadData.messageType === 'image' ? 'Photo' : uploadData.fileName,
-              messageType: uploadData.messageType,
-              fileUrl: uploadData.fileUrl,
-              fileName: uploadData.fileName,
-              fileSize: uploadData.fileSize,
-            }),
-          });
+      if (!res.ok) {
+        throw new Error(uploadData.error || 'Failed to upload file.');
+      }
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'send_message',
+            receiverId: activeContact.id,
+            content: uploadData.messageType === 'image' ? 'Photo' : uploadData.fileName,
+            messageType: uploadData.messageType,
+            fileUrl: uploadData.fileUrl,
+            fileName: uploadData.fileName,
+            fileSize: uploadData.fileSize,
+          })
+        );
+      } else {
+        const messageRes = await fetch('/api/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            senderId: currentUser.id,
+            receiverId: activeContact.id,
+            content: uploadData.messageType === 'image' ? 'Photo' : uploadData.fileName,
+            messageType: uploadData.messageType,
+            fileUrl: uploadData.fileUrl,
+            fileName: uploadData.fileName,
+            fileSize: uploadData.fileSize,
+          }),
+        });
+        if (!messageRes.ok) {
+          const messageData = await messageRes.json();
+          throw new Error(messageData.error || 'Failed to send file.');
         }
       }
     } catch (err) {
       console.error('File upload error:', err);
+      setUploadError(err instanceof Error ? err.message : 'Failed to upload file.');
     } finally {
       setUploading(false);
       if (e.target) e.target.value = '';
+    }
+  };
+
+  const handleSecureImageSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.type !== 'image/png' || file.size > 8 * 1024 * 1024) {
+      setSecureImage(null);
+      setUploadError('Secure image messages require a PNG smaller than 8 MB.');
+      e.target.value = '';
+      return;
+    }
+
+    try {
+      const bitmap = await createImageBitmap(file);
+      const validDimensions = bitmap.width * bitmap.height <= 2_500_000;
+      bitmap.close();
+      if (!validDimensions) {
+        setSecureImage(null);
+        setUploadError('The PNG must contain no more than 2.5 megapixels.');
+        e.target.value = '';
+        return;
+      }
+      setUploadError('');
+      setSecureImage(file);
+    } catch (err) {
+      console.error('Secure PNG validation error:', err);
+      setSecureImage(null);
+      setUploadError('Could not read the selected PNG image.');
+      e.target.value = '';
+    }
+  };
+
+  const handleSetSecureKey = async () => {
+    if (!activeContact || !securePassphrase) return;
+    setUploadError('');
+    try {
+      const res = await fetch(
+        `/api/friends/${encodeURIComponent(activeContact.id)}/secure-key`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ secret: securePassphrase }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not set the shared passphrase.');
+      setSecureKeyStatus({
+        configured: true,
+        ready: Boolean(data.ready),
+        setByMe: Boolean(data.setByMe),
+        confirmedByMe: Boolean(data.confirmedByMe),
+        salt: data.salt || null,
+      });
+      setSecureKeyError('');
+      setUploadError(data.message || '');
+    } catch (err) {
+      console.error('Secure key setup error:', err);
+      setUploadError(err instanceof Error ? err.message : 'Could not set shared passphrase.');
+    }
+  };
+
+  const handleSecureMessageSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (
+      !activeContact ||
+      !secureKeyStatus?.ready ||
+      !secureKeyStatus.salt ||
+      !secureImage ||
+      !inputVal.trim() ||
+      !securePassphrase
+    ) {
+      setUploadError('A confirmed shared passphrase, PNG image, and text are required.');
+      return;
+    }
+
+    setUploading(true);
+    setUploadError('');
+    try {
+      const key = await deriveSecureMessageKey(securePassphrase, secureKeyStatus.salt);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encryptedText = new Uint8Array(
+        await crypto.subtle.encrypt(
+          {
+            name: 'AES-GCM',
+            iv: toArrayBuffer(iv),
+            additionalData: secureMessageAad(currentUser.id, activeContact.id),
+          },
+          key,
+          toArrayBuffer(new TextEncoder().encode(inputVal.trim()))
+        )
+      );
+      const payload = new Uint8Array(iv.length + encryptedText.length);
+      payload.set(iv);
+      payload.set(encryptedText, iv.length);
+      const imageBase64 = bytesToBase64(
+        new Uint8Array(await secureImage.arrayBuffer())
+      );
+
+      const res = await fetch('/api/secure/messages', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          friendId: activeContact.id,
+          imageBase64,
+          payloadBase64: bytesToBase64(payload),
+        }),
+      });
+      const data = await res.json();
+      payload.fill(0);
+      encryptedText.fill(0);
+      if (!res.ok) throw new Error(data.error || 'Failed to send secure image.');
+
+      setMessages((previous) =>
+        previous.some((message) => message.id === data.message.id)
+          ? previous
+          : [...previous, data.message]
+      );
+      setInputVal('');
+      setSecureImage(null);
+      setShowEmojiPicker(false);
+      if (secureImageInputRef.current) secureImageInputRef.current.value = '';
+    } catch (err) {
+      console.error('Secure message send error:', err);
+      setUploadError(err instanceof Error ? err.message : 'Failed to send secure image.');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleDecryptSecureMessage = async (message: Message) => {
+    if (!activeContact || !secureKeyStatus?.salt || !securePassphrase) {
+      setUploadError('Enter your confirmed shared passphrase first.');
+      return;
+    }
+
+    setSecureProcessingId(message.id);
+    setUploadError('');
+    let combined: Uint8Array | undefined;
+    let plaintext: Uint8Array | undefined;
+    try {
+      const payloadRes = await fetch(
+        `/api/secure/messages/${encodeURIComponent(message.id)}/payload`,
+        { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const payloadData = await payloadRes.json();
+      if (!payloadRes.ok) throw new Error(payloadData.error || 'Could not read secure message.');
+
+      combined = base64ToBytes(payloadData.payloadBase64);
+      if (combined.length < 28) throw new Error('The encrypted message is incomplete.');
+      const iv = combined.slice(0, 12);
+      const encryptedText = combined.slice(12);
+      const key = await deriveSecureMessageKey(securePassphrase, secureKeyStatus.salt);
+      plaintext = new Uint8Array(
+        await crypto.subtle.decrypt(
+          {
+            name: 'AES-GCM',
+            iv: toArrayBuffer(iv),
+            additionalData: secureMessageAad(currentUser.id, activeContact.id),
+          },
+          key,
+          toArrayBuffer(encryptedText)
+        )
+      );
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(plaintext);
+
+      const consumeRes = await fetch(
+        `/api/secure/messages/${encodeURIComponent(message.id)}/consume`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      const consumeData = await consumeRes.json();
+      if (!consumeRes.ok) throw new Error(consumeData.error || 'This message was already viewed.');
+
+      setRevealedSecureMessages((previous) => ({ ...previous, [message.id]: text }));
+      setMessages((previous) =>
+        previous.map((item) =>
+          item.id === message.id ? { ...item, secureConsumed: true } : item
+        )
+      );
+    } catch (err) {
+      console.error('Secure message decryption error:', err);
+      const wrongPassphrase =
+        err instanceof DOMException && err.name === 'OperationError';
+      setUploadError(
+        wrongPassphrase
+          ? 'The passphrase is incorrect or the message was altered.'
+          : err instanceof Error
+            ? err.message
+            : 'Could not decrypt secure message.'
+      );
+    } finally {
+      combined?.fill(0);
+      plaintext?.fill(0);
+      setSecureProcessingId(null);
     }
   };
 
@@ -497,7 +840,7 @@ function ChatViewPanel({
   );
 
   return (
-    <div className="chatvia-app">
+    <div className={`chatvia-app${mobileChatOpen ? ' mobile-chat-open' : ''}`}>
       {/* 1. Leftmost Navigation Rail */}
       <aside className="nav-rail">
         <div className="rail-top">
@@ -536,16 +879,6 @@ function ChatViewPanel({
               👤
             </button>
 
-            {onToggleSplit && (
-              <button
-                type="button"
-                className={`rail-nav-btn ${isSplitActive ? 'active' : ''}`}
-                onClick={onToggleSplit}
-                title="Split-Screen Demo (2 Users side-by-side)"
-              >
-                ⚡
-              </button>
-            )}
           </div>
         </div>
 
@@ -572,11 +905,37 @@ function ChatViewPanel({
 
       {/* 2. Middle Panel: Chats / Friends / Profile */}
       <div className="sidebar-panel">
+        <nav className="mobile-nav-tabs" aria-label="Main navigation">
+          <button
+            type="button"
+            className={activeTab === 'chats' ? 'active' : ''}
+            onClick={() => setActiveTab('chats')}
+          >
+            Chats
+          </button>
+          <button
+            type="button"
+            className={activeTab === 'friends' ? 'active' : ''}
+            onClick={() => setActiveTab('friends')}
+          >
+            Friends{pendingIncoming.length > 0 ? ` (${pendingIncoming.length})` : ''}
+          </button>
+          <button
+            type="button"
+            className={activeTab === 'profile' ? 'active' : ''}
+            onClick={() => setActiveTab('profile')}
+          >
+            Profile
+          </button>
+          <button type="button" onClick={toggleTheme} aria-label="Toggle theme">
+            {theme === 'light' ? '🌙' : '☀️'}
+          </button>
+        </nav>
         {activeTab === 'chats' && (
           <>
             <div className="panel-header">
               <div className="panel-title-row">
-                <h2 className="panel-heading">{paneTitle || 'Chats'}</h2>
+                <h2 className="panel-heading">Chats</h2>
                 <button
                   type="button"
                   className="panel-add-btn"
@@ -606,7 +965,7 @@ function ChatViewPanel({
                   key={f.id}
                   className="story-user-item"
                   onClick={() => {
-                    setActiveContact(f);
+                    handleSelectContact(f);
                     setMessageAllowed(true);
                   }}
                 >
@@ -635,7 +994,7 @@ function ChatViewPanel({
                       key={friend.id}
                       className={`chat-item ${isActive ? 'active' : ''}`}
                       onClick={() => {
-                        setActiveContact(friend);
+                        handleSelectContact(friend);
                         setMessageAllowed(true);
                       }}
                     >
@@ -705,13 +1064,13 @@ function ChatViewPanel({
                 <span>🔍</span> Find User by User ID
               </span>
               <p style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-                Ask your friend for their User ID (e.g. <code>UID-7002</code>, <code>UID-7004</code>) to reveal their profile and connect:
+                Ask your friend for their User ID to reveal their profile and connect:
               </p>
               <form onSubmit={handleLookupUserId} className="friend-send-form">
                 <input
                   type="text"
                   className="friend-send-input"
-                  placeholder="Enter User ID (e.g. UID-7004)"
+                  placeholder="Enter User ID"
                   value={targetIdInput}
                   onChange={(e) => setTargetIdInput(e.target.value)}
                   required
@@ -750,7 +1109,7 @@ function ChatViewPanel({
                         onClick={() => {
                           const friendObj = friends.find((f) => f.id === foundUser.id);
                           if (friendObj) {
-                            setActiveContact(friendObj);
+                            handleSelectContact(friendObj);
                             setMessageAllowed(true);
                             setActiveTab('chats');
                           }
@@ -947,6 +1306,14 @@ function ChatViewPanel({
           <>
             {/* Header */}
             <div className="chat-header-bar">
+              <button
+                type="button"
+                className="mobile-chat-back"
+                onClick={() => setMobileChatOpen(false)}
+                aria-label="Back to chats"
+              >
+                ←
+              </button>
               <div className="chat-header-contact">
                 <div className="header-avatar-wrap">
                   <img src={activeContact.avatar} alt={activeContact.fullName} className="header-avatar" />
@@ -964,9 +1331,17 @@ function ChatViewPanel({
               </div>
 
               <div className="header-actions">
-                <button type="button" className="header-icon-btn" title="Voice Call">📞</button>
-                <button type="button" className="header-icon-btn" title="Video Call">📹</button>
-                <button type="button" className="header-icon-btn" title="Profile Details" onClick={() => setActiveTab('profile')}>ℹ️</button>
+                <button
+                  type="button"
+                  className="header-icon-btn"
+                  title="Profile Details"
+                  onClick={() => {
+                    setActiveTab('profile');
+                    setMobileChatOpen(false);
+                  }}
+                >
+                  ℹ️
+                </button>
               </div>
             </div>
 
@@ -994,10 +1369,41 @@ function ChatViewPanel({
                         )}
                         <div className="msg-content-wrapper">
                           {/* Image Message */}
-                          {m.messageType === 'image' && m.fileUrl ? (
+                          {m.isSecure ? (
                             <div className="msg-image-bubble">
-                              <a href={m.fileUrl} target="_blank" rel="noopener noreferrer">
-                                <img src={m.fileUrl} alt={m.fileName || 'Attached Photo'} />
+                              {secureImageUrls[m.id] ? (
+                                <img
+                                  src={secureImageUrls[m.id]}
+                                  alt="Steganographic PNG message"
+                                />
+                              ) : (
+                                <span>Loading secure image…</span>
+                              )}
+                              {revealedSecureMessages[m.id] ? (
+                                <div className="secure-message-revealed">
+                                  <strong>Decrypted text</strong>
+                                  <p>{revealedSecureMessages[m.id]}</p>
+                                  <small>Viewed once; the original PNG has been restored.</small>
+                                </div>
+                              ) : m.secureConsumed ? (
+                                <small>Viewed once; the original PNG has been restored.</small>
+                              ) : m.receiverId === currentUser.id ? (
+                                <button
+                                  type="button"
+                                  className="friend-send-btn"
+                                  disabled={secureProcessingId === m.id || !secureKeyStatus?.ready}
+                                  onClick={() => handleDecryptSecureMessage(m)}
+                                >
+                                  {secureProcessingId === m.id ? 'Decrypting…' : 'Decrypt once'}
+                                </button>
+                              ) : (
+                                <small>Only the recipient can decrypt this message once.</small>
+                              )}
+                            </div>
+                          ) : m.messageType === 'image' && m.fileUrl ? (
+                            <div className="msg-image-bubble">
+                              <a href={`${m.fileUrl}?userId=${encodeURIComponent(currentUser.id)}`} target="_blank" rel="noopener noreferrer">
+                              <img src={`${m.fileUrl}?userId=${encodeURIComponent(currentUser.id)}`} alt={m.fileName || 'Attached Photo'} />
                               </a>
                             </div>
                           ) : m.messageType === 'file' && m.fileUrl ? (
@@ -1009,7 +1415,7 @@ function ChatViewPanel({
                                 <span className="file-size-text">{m.fileSize || 'File'}</span>
                               </div>
                               <a
-                                href={m.fileUrl}
+                                href={`${m.fileUrl}?userId=${encodeURIComponent(currentUser.id)}`}
                                 download={m.fileName || 'download'}
                                 className="file-download-btn"
                                 title="Download file"
@@ -1107,29 +1513,175 @@ function ChatViewPanel({
               style={{ display: 'none' }}
               onChange={handleFileUpload}
             />
+            <input
+              type="file"
+              ref={secureImageInputRef}
+              accept="image/png"
+              style={{ display: 'none' }}
+              onChange={handleSecureImageSelected}
+            />
 
             {/* Input Bar */}
+            {uploadError && (
+              <p role="alert" className="auth-error-alert">
+                {uploadError}
+              </p>
+            )}
             {messageAllowed && (
-              <form onSubmit={handleSendMessage} className="chat-input-bar">
+              <form
+                onSubmit={secureMode ? handleSecureMessageSubmit : handleSendMessage}
+                className="chat-input-bar"
+              >
+                <button
+                  type="button"
+                  className={`inline-flex w-full items-center justify-between rounded-xl border px-4 py-3 text-left text-sm font-semibold shadow-sm transition sm:w-auto ${
+                    secureMode
+                      ? 'border-indigo-500 bg-indigo-600 text-white hover:bg-indigo-700'
+                      : 'border-[var(--border-color)] bg-[var(--bg-card)] text-[var(--text-primary)] hover:border-indigo-400'
+                  }`}
+                  aria-pressed={secureMode}
+                  onClick={() => {
+                    setSecureMode((enabled) => !enabled);
+                    setSecureImage(null);
+                    setUploadError('');
+                    if (secureImageInputRef.current) secureImageInputRef.current.value = '';
+                  }}
+                >
+                  <span>{secureMode ? 'Private image message' : 'Send a private image message'}</span>
+                  <span className={`ml-4 rounded-full px-2 py-0.5 text-xs ${
+                    secureMode ? 'bg-white/20 text-white' : 'bg-[var(--bg-input)] text-[var(--text-secondary)]'
+                  }`}>
+                    {secureMode ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+                {secureMode && (
+                  <section className="w-full rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-violet-50 p-4 text-slate-800 shadow-sm dark:border-indigo-400/30 dark:from-slate-800 dark:to-slate-900 dark:text-slate-100 sm:p-5">
+                    <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="grid h-9 w-9 place-items-center rounded-xl bg-indigo-100 text-lg dark:bg-indigo-400/15">🔐</span>
+                          <h3 className="text-sm font-bold sm:text-base">Shared passphrase</h3>
+                        </div>
+                        <p className="mt-2 max-w-xl text-xs leading-relaxed text-slate-600 dark:text-slate-300 sm:text-sm">
+                          Set a passphrase now. Your friend can confirm it later by entering the same one. The passphrase stays in this browser.
+                        </p>
+                      </div>
+                      <span className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                        secureKeyStatus?.ready
+                          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-400/15 dark:text-emerald-300'
+                          : secureKeyStatus?.configured
+                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-400/15 dark:text-amber-200'
+                            : 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+                      }`}>
+                        {!secureKeyStatus
+                          ? 'Checking…'
+                          : secureKeyStatus.ready
+                            ? 'Ready for you'
+                            : secureKeyStatus.configured
+                              ? secureKeyStatus.setByMe ? 'Waiting for friend' : 'Confirmation needed'
+                              : 'Not set up'}
+                      </span>
+                    </div>
+
+                    {secureKeyError && (
+                      <p role="alert" className="mb-3 rounded-lg bg-rose-100 px-3 py-2 text-xs text-rose-700 dark:bg-rose-400/10 dark:text-rose-200">
+                        {secureKeyError}
+                      </p>
+                    )}
+                    {secureKeyStatus?.configured && (
+                      <p className="mb-3 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                        {secureKeyStatus.ready
+                          ? 'Your passphrase is ready for sending and decrypting messages.'
+                          : secureKeyStatus.setByMe
+                            ? 'You can send with this passphrase now. Your friend can confirm it whenever they are ready.'
+                            : 'Your friend has already set a passphrase. Enter the matching passphrase to confirm.'}
+                      </p>
+                    )}
+
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <input
+                        type="password"
+                        autoComplete="current-password"
+                        minLength={12}
+                        maxLength={256}
+                        aria-label="Shared passphrase"
+                        placeholder="Enter shared passphrase (12+ characters)"
+                        value={securePassphrase}
+                        onChange={(event) => setSecurePassphrase(event.target.value)}
+                        className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 dark:border-slate-600 dark:bg-slate-800 dark:text-white dark:focus:ring-indigo-500/20"
+                      />
+                      <button
+                        type="button"
+                        className="inline-flex min-h-11 items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        disabled={
+                          !secureKeyStatus ||
+                          secureKeyStatus.ready ||
+                          (secureKeyStatus.setByMe && !secureKeyStatus.confirmedByMe) ||
+                          !securePassphrase.trim()
+                        }
+                        onClick={handleSetSecureKey}
+                      >
+                        {!secureKeyStatus
+                          ? 'Checking…'
+                          : secureKeyStatus.ready
+                            ? 'Shared key ready'
+                            : !secureKeyStatus.configured
+                              ? 'Set passphrase'
+                              : secureKeyStatus.setByMe
+                                ? 'Passphrase set'
+                                : 'Confirm passphrase'}
+                      </button>
+                    </div>
+                    <div className="mt-4 flex flex-col gap-2 border-t border-indigo-200/70 pt-4 dark:border-slate-700 sm:flex-row sm:items-center">
+                      <button
+                        type="button"
+                        className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl border border-indigo-200 bg-white px-4 py-2.5 text-sm font-semibold text-indigo-700 transition hover:border-indigo-400 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-indigo-200 dark:hover:bg-slate-700"
+                        disabled={uploading || !secureKeyStatus?.ready}
+                        onClick={() => {
+                          if (secureImageInputRef.current) {
+                            secureImageInputRef.current.value = '';
+                            secureImageInputRef.current.click();
+                          }
+                        }}
+                      >
+                        <span aria-hidden="true">＋</span>
+                        {secureImage ? 'Change PNG image' : 'Choose PNG image'}
+                      </button>
+                      <p className="min-w-0 truncate text-xs text-slate-600 dark:text-slate-300">
+                        {secureImage
+                          ? `${secureImage.name} · ${(secureImage.size / 1024).toFixed(0)} KB`
+                          : secureKeyStatus?.ready
+                            ? 'PNG up to 8 MB · text is encrypted before sending'
+                            : 'Confirm the shared passphrase to choose an image'}
+                      </p>
+                    </div>
+                  </section>
+                )}
                 <div className="input-container-pill">
                   <input
                     type="text"
                     className="chat-input-field"
-                    placeholder={uploading ? 'Uploading file...' : 'Enter Message...'}
+                    placeholder={
+                      uploading
+                        ? 'Processing...'
+                        : secureMode
+                          ? 'Text to encrypt and hide in the PNG…'
+                          : 'Enter Message...'
+                    }
                     value={inputVal}
                     onChange={handleInputChange}
                     disabled={uploading}
                     autoFocus
                   />
-                  <button
+                  {!secureMode && <button
                     type="button"
                     className="input-action-btn"
                     title="Insert Emoji"
                     onClick={() => setShowEmojiPicker(!showEmojiPicker)}
                   >
                     😊
-                  </button>
-                  <button
+                  </button>}
+                  {!secureMode && <button
                     type="button"
                     className="input-action-btn"
                     title="Attach Image"
@@ -1137,8 +1689,8 @@ function ChatViewPanel({
                     disabled={uploading}
                   >
                     📷
-                  </button>
-                  <button
+                  </button>}
+                  {!secureMode && <button
                     type="button"
                     className="input-action-btn"
                     title="Attach File/Document"
@@ -1146,12 +1698,17 @@ function ChatViewPanel({
                     disabled={uploading}
                   >
                     📎
-                  </button>
+                  </button>}
                 </div>
                 <button
                   type="submit"
                   className="chat-send-submit-btn"
-                  disabled={!inputVal.trim() || uploading}
+                  disabled={
+                    !inputVal.trim() ||
+                    uploading ||
+                    (secureMode &&
+                      (!secureImage || !securePassphrase || !secureKeyStatus?.ready))
+                  }
                   title="Send Message"
                 >
                   {uploading ? '⏳' : '➤'}
@@ -1174,13 +1731,8 @@ function ChatViewPanel({
 }
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    const saved = sessionStorage.getItem('chatvia_user_pg');
-    return saved ? JSON.parse(saved) : null;
-  });
-
-  const [dualMode, setDualMode] = useState(false);
-  const [dualUserPatrick, setDualUserPatrick] = useState<User | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [accessToken, setAccessToken] = useState<string | null>(null);
 
   // Auth Form State
   const [isLogin, setIsLogin] = useState(true);
@@ -1190,21 +1742,76 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [loading, setLoading] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [faceImage, setFaceImage] = useState<string | null>(null);
+  const [faceConsent, setFaceConsent] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
 
-  const saveUserSession = (user: User) => {
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.srcObject = cameraStream;
+    }
+    return () => {
+      cameraStream?.getTracks().forEach((track) => track.stop());
+    };
+  }, [cameraStream]);
+
+  const saveUserSession = (user: User, token?: string) => {
     setCurrentUser(user);
-    sessionStorage.setItem('chatvia_user_pg', JSON.stringify(user));
+    if (token) setAccessToken(token);
   };
 
   const handleLogout = () => {
     setCurrentUser(null);
-    sessionStorage.removeItem('chatvia_user_pg');
+    setAccessToken(null);
+  };
+
+  const startFaceCamera = async () => {
+    setErrorMsg('');
+    setFaceImage(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      setCameraStream(stream);
+    } catch (err) {
+      console.error('Camera access error:', err);
+      setErrorMsg('Camera access is required for face enrollment. Allow camera access and try again.');
+    }
+  };
+
+  const captureFace = () => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
+      setErrorMsg('The camera is not ready yet. Please try again.');
+      return;
+    }
+
+    const scale = Math.min(1, 720 / Math.max(video.videoWidth, video.videoHeight));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    const context = canvas.getContext('2d');
+    if (!context) {
+      setErrorMsg('Could not capture an image from the camera.');
+      return;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    setFaceImage(canvas.toDataURL('image/jpeg', 0.85).split(',')[1] || null);
+    setCameraStream(null);
+    setErrorMsg('');
   };
 
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
 
+    if (!isLogin && (!faceImage || !faceConsent)) {
+      setErrorMsg('Capture your face and provide consent to complete registration.');
+      return;
+    }
     if (!username.trim() || !email.trim() || !password.trim()) {
       setErrorMsg('Please provide username, Gmail ID, and password.');
       return;
@@ -1222,14 +1829,20 @@ export default function App() {
           username: username.trim(),
           email: email.trim(),
           password: password.trim(),
+          ...(isLogin ? {} : { faceImage, faceConsent }),
         }),
       });
 
       const data = await res.json();
       if (!res.ok) {
         setErrorMsg(data.error || 'Authentication failed.');
+      } else if (typeof data.token !== 'string') {
+        setErrorMsg('Authentication server returned no access token.');
       } else {
-        saveUserSession(data.user);
+        saveUserSession(data.user, data.token);
+        setCameraStream(null);
+        setFaceImage(null);
+        setFaceConsent(false);
         setUsername('');
         setEmail('');
         setPassword('');
@@ -1242,60 +1855,7 @@ export default function App() {
     }
   };
 
-  const quickLogin = async (uname: string, uemail: string, pword: string) => {
-    setErrorMsg('');
-    setLoading(true);
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: uname, email: uemail, password: pword }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        saveUserSession(data.user);
-      } else {
-        setErrorMsg(data.error || 'Login failed.');
-      }
-    } catch {
-      setErrorMsg('Failed to connect to backend.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Toggle Dual Mode (Doris UID-7001 on left, Patrick UID-7002 on right)
-  const toggleDualMode = async () => {
-    if (!dualMode) {
-      try {
-        const resDoris = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'doris', email: 'doris@gmail.com', password: 'doris123' }),
-        });
-        const dataDoris = await resDoris.json();
-
-        const resPatrick = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'patrick', email: 'patrick@gmail.com', password: 'patrick123' }),
-        });
-        const dataPatrick = await resPatrick.json();
-
-        if (resDoris.ok && resPatrick.ok) {
-          saveUserSession(dataDoris.user);
-          setDualUserPatrick(dataPatrick.user);
-          setDualMode(true);
-          return;
-        }
-      } catch (err) {
-        console.error('Failed to init dual view:', err);
-      }
-    }
-    setDualMode(!dualMode);
-  };
-
-  if (!currentUser && !dualMode) {
+  if (!currentUser || !accessToken) {
     return (
       <div className="auth-page-wrapper">
         <div className="auth-modal-card">
@@ -1318,6 +1878,9 @@ export default function App() {
               onClick={() => {
                 setIsLogin(true);
                 setErrorMsg('');
+                setCameraStream(null);
+                setFaceImage(null);
+                setFaceConsent(false);
               }}
             >
               Sign In
@@ -1328,6 +1891,9 @@ export default function App() {
               onClick={() => {
                 setIsLogin(false);
                 setErrorMsg('');
+                setCameraStream(null);
+                setFaceImage(null);
+                setFaceConsent(false);
               }}
             >
               Sign Up
@@ -1343,7 +1909,7 @@ export default function App() {
                 <input
                   type="text"
                   className="auth-input-control"
-                  placeholder="e.g. Doris Brown"
+                  placeholder="Your full name"
                   value={fullName}
                   onChange={(e) => setFullName(e.target.value)}
                   required={!isLogin}
@@ -1356,7 +1922,7 @@ export default function App() {
               <input
                 type="text"
                 className="auth-input-control"
-                placeholder="e.g. doris"
+                placeholder="Choose a username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 required
@@ -1368,7 +1934,7 @@ export default function App() {
               <input
                 type="email"
                 className="auth-input-control"
-                placeholder="e.g. doris@gmail.com"
+                placeholder="you@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
@@ -1387,102 +1953,82 @@ export default function App() {
               />
             </div>
 
+            {!isLogin && (
+              <div className="auth-input-group">
+                <label className="auth-input-label">Required face enrollment</label>
+                <p className="auth-subtitle">
+                  Capture one clearly visible face. We create an InspireFace recognition template and store it encrypted in the database; the camera image is not retained. This is not a liveness check.
+                </p>
+                {cameraStream && !faceImage && (
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    aria-label="Live face enrollment camera"
+                    className="auth-face-media"
+                  />
+                )}
+                {faceImage && (
+                  <img
+                    src={`data:image/jpeg;base64,${faceImage}`}
+                    alt="Captured face for enrollment"
+                    className="auth-face-media"
+                  />
+                )}
+                <div className="auth-camera-actions">
+                  {!cameraStream && (
+                    <button
+                      type="button"
+                      className="auth-primary-btn"
+                      onClick={startFaceCamera}
+                    >
+                      {faceImage ? 'Retake Face Capture' : 'Enable Camera'}
+                    </button>
+                  )}
+                  {cameraStream && (
+                    <>
+                      <button type="button" className="auth-primary-btn" onClick={captureFace}>
+                        Capture Face
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-reject"
+                        onClick={() => setCameraStream(null)}
+                      >
+                        Stop Camera
+                      </button>
+                    </>
+                  )}
+                </div>
+                <label className="auth-consent-label">
+                  <input
+                    type="checkbox"
+                    checked={faceConsent}
+                    onChange={(event) => setFaceConsent(event.target.checked)}
+                    required
+                  />
+                  I consent to creating and storing an encrypted facial recognition template for this account.
+                </label>
+              </div>
+            )}
+
             <button type="submit" className="auth-primary-btn" disabled={loading}>
               {loading ? 'Please wait...' : isLogin ? 'Sign In' : 'Create Account'}
             </button>
           </form>
 
-          {/* Quick 1-Click Demo Accounts */}
-          <div className="auth-quick-select">
-            <span className="auth-quick-title">⚡ Instant Demo Logins</span>
-            <div className="quick-users-grid">
-              <div
-                className="quick-user-card"
-                onClick={() => quickLogin('doris', 'doris@gmail.com', 'doris123')}
-              >
-                <img
-                  src="https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150"
-                  alt="Doris"
-                  className="quick-user-avatar"
-                />
-                <span className="quick-user-name">Doris Brown</span>
-                <span style={{ fontSize: 10, color: 'var(--text-secondary)' }}>UID-7001</span>
-              </div>
-
-              <div
-                className="quick-user-card"
-                onClick={() => quickLogin('patrick', 'patrick@gmail.com', 'patrick123')}
-              >
-                <img
-                  src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150"
-                  alt="Patrick"
-                  className="quick-user-avatar"
-                />
-                <span className="quick-user-name">Patrick H.</span>
-                <span style={{ fontSize: 10, color: 'var(--text-secondary)' }}>UID-7002</span>
-              </div>
-
-              <div
-                className="quick-user-card"
-                onClick={() => quickLogin('steve', 'steve@gmail.com', 'steve123')}
-              >
-                <img
-                  src="https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
-                  alt="Steve"
-                  className="quick-user-avatar"
-                />
-                <span className="quick-user-name">Steve Walker</span>
-                <span style={{ fontSize: 10, color: 'var(--text-secondary)' }}>UID-7004</span>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
     );
   }
 
-  // Dual View Mode (Doris on left, Patrick on right)
-  if (dualMode && dualUserPatrick && currentUser) {
-    return (
-      <div className="split-mode-container">
-        <div className="split-pane-half">
-          <div className="split-top-bar">
-            👤 User 1: @{currentUser.username} ({currentUser.userIdCode})
-          </div>
-          <ChatViewPanel
-            currentUser={currentUser}
-            paneTitle={`@${currentUser.username}`}
-            forcedActiveUserId={dualUserPatrick.id}
-            onToggleSplit={toggleDualMode}
-            isSplitActive={true}
-            onUserUpdate={saveUserSession}
-          />
-        </div>
-
-        <div className="split-pane-half">
-          <div className="split-top-bar">
-            👤 User 2: @{dualUserPatrick.username} ({dualUserPatrick.userIdCode})
-          </div>
-          <ChatViewPanel
-            currentUser={dualUserPatrick}
-            paneTitle={`@${dualUserPatrick.username}`}
-            forcedActiveUserId={currentUser.id}
-            onToggleSplit={toggleDualMode}
-            isSplitActive={true}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  // Single Standard Mode
   return (
     currentUser && (
       <ChatViewPanel
         currentUser={currentUser}
+        accessToken={accessToken}
         onLogout={handleLogout}
-        onToggleSplit={toggleDualMode}
-        isSplitActive={false}
         onUserUpdate={saveUserSession}
       />
     )

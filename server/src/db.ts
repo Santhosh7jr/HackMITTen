@@ -1,15 +1,17 @@
+import dotenv from "dotenv";
 import pkg from "pg";
 const { Pool } = pkg;
 import crypto from "crypto";
-import fs from "fs";
-import path from "path";
+import { fileURLToPath } from "url";
+
+dotenv.config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
 
 // PostgreSQL Pool Connection
 export const pool = new Pool({
   host: process.env.PG_HOST || "localhost",
   port: Number(process.env.PG_PORT) || 5432,
   user: process.env.PG_USER || "postgres",
-  password: process.env.PG_PASSWORD || "help",
+  password: process.env.PG_PASSWORD,
   database: process.env.PG_DATABASE || "postgres",
 });
 
@@ -22,35 +24,7 @@ export function generateUserIdCode(): string {
   return `UID-${randomNum}`;
 }
 
-// Storage folders structure setup
-export const STORAGE_DIR = path.resolve("./storage");
-export const CHAT_DIR = path.join(STORAGE_DIR, "chat");
-export const IMAGES_DIR = path.join(STORAGE_DIR, "images");
-export const FILES_DIR = path.join(STORAGE_DIR, "files");
-export const AVATARS_DIR = path.join(STORAGE_DIR, "avatars");
-
-export function initStorageFolders() {
-  [STORAGE_DIR, CHAT_DIR, IMAGES_DIR, FILES_DIR, AVATARS_DIR].forEach((dir) => {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-  });
-}
-
-// Save chat transcript to storage/chat/ folder
-export function backupChatToFile(user1: string, user2: string, messages: any[]) {
-  try {
-    const pairKey = [user1, user2].sort().join("_");
-    const filePath = path.join(CHAT_DIR, `chat_${pairKey}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(messages, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Failed to write chat file to storage/chat:", err);
-  }
-}
-
 export async function initDatabase() {
-  initStorageFolders();
-
   const client = await pool.connect();
   try {
     // 1. Create tables
@@ -67,6 +41,15 @@ export async function initDatabase() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS face_biometrics (
+        user_id VARCHAR(64) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        template_ciphertext BYTEA NOT NULL,
+        nonce BYTEA NOT NULL,
+        auth_tag BYTEA NOT NULL,
+        algorithm VARCHAR(64) NOT NULL,
+        consented_at TIMESTAMP WITH TIME ZONE NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS friend_requests (
         id VARCHAR(64) PRIMARY KEY,
         sender_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
@@ -74,6 +57,15 @@ export async function initDatabase() {
         status VARCHAR(20) DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(sender_id, receiver_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS friendship_secrets (
+        friendship_id VARCHAR(64) PRIMARY KEY REFERENCES friend_requests(id) ON DELETE CASCADE,
+        salt BYTEA NOT NULL,
+        secret_hash BYTEA NOT NULL,
+        set_by VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        confirmed_by VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+        confirmed_at TIMESTAMP WITH TIME ZONE
       );
 
       CREATE TABLE IF NOT EXISTS messages (
@@ -85,140 +77,77 @@ export async function initDatabase() {
         file_url TEXT,
         file_name VARCHAR(255),
         file_size VARCHAR(64),
+        is_secure BOOLEAN NOT NULL DEFAULT FALSE,
         timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_secure BOOLEAN NOT NULL DEFAULT FALSE;
+
+      CREATE TABLE IF NOT EXISTS attachments (
+        id VARCHAR(64) PRIMARY KEY,
+        owner_id VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        file_name VARCHAR(255) NOT NULL,
+        content_type VARCHAR(255) NOT NULL,
+        file_data BYTEA NOT NULL,
+        file_size BIGINT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS stego_messages (
+        message_id VARCHAR(64) PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        attachment_id VARCHAR(64) NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+        original_png BYTEA,
+        consumed_at TIMESTAMP WITH TIME ZONE
       );
 
       CREATE INDEX IF NOT EXISTS idx_messages_pair_pg ON messages (sender_id, receiver_id, timestamp);
       CREATE INDEX IF NOT EXISTS idx_users_id_code ON users (user_id_code);
       CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
+      CREATE INDEX IF NOT EXISTS idx_attachments_owner_id ON attachments (owner_id);
     `);
 
-    // 2. Check if users table is empty; if so, seed demo users
-    const userCountRes = await client.query("SELECT COUNT(*) FROM users");
-    const count = parseInt(userCountRes.rows[0].count, 10);
+    await client.query(`
+      ALTER TABLE stego_messages
+        ADD COLUMN IF NOT EXISTS attachment_id VARCHAR(64);
 
-    if (count === 0) {
-      console.log("Seeding initial users into PostgreSQL...");
+      ALTER TABLE stego_messages
+        ALTER COLUMN original_png DROP NOT NULL;
 
-      const demoUsers = [
-        {
-          id: "u_doris",
-          user_id_code: "UID-1001",
-          username: "doris",
-          email: "doris@gmail.com",
-          fullName: "Doris Brown",
-          passwordHash: hashPassword("doris123"),
-          avatar: "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150",
-          bio: "Product Designer & Tech Enthusiast 🎨",
-        },
-        {
-          id: "u_patrick",
-          user_id_code: "UID-1002",
-          username: "patrick",
-          email: "patrick@gmail.com",
-          fullName: "Patrick Hendricks",
-          passwordHash: hashPassword("patrick123"),
-          avatar: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150",
-          bio: "Software Architect & Coffee lover ☕",
-        },
-        {
-          id: "u_steve",
-          user_id_code: "UID-1003",
-          username: "steve",
-          email: "steve@gmail.com",
-          fullName: "Steve Walker",
-          passwordHash: hashPassword("steve123"),
-          avatar: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150",
-          bio: "DevOps Engineer | Cloud Infrastructure ☁️",
-        },
-        {
-          id: "u_mark",
-          user_id_code: "UID-1004",
-          username: "mark",
-          email: "mark@gmail.com",
-          fullName: "Mark Messer",
-          passwordHash: hashPassword("mark123"),
-          avatar: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150",
-          bio: "Full-Stack Developer 💻",
-        },
-        {
-          id: "u_emily",
-          user_id_code: "UID-1005",
-          username: "emily",
-          email: "emily@gmail.com",
-          fullName: "Emily Clark",
-          passwordHash: hashPassword("emily123"),
-          avatar: "https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150",
-          bio: "UI/UX Researcher & Writer 📚",
-        },
-      ];
+      UPDATE stego_messages sm
+      SET attachment_id = a.id
+      FROM messages m
+      JOIN attachments a
+        ON a.file_name = m.id || '.png'
+        OR m.file_url = '/api/files/' || a.id
+      WHERE sm.message_id = m.id
+        AND sm.attachment_id IS NULL;
 
-      for (const u of demoUsers) {
-        await client.query(
-          `INSERT INTO users (id, user_id_code, username, email, full_name, password_hash, avatar, bio)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (id) DO NOTHING`,
-          [u.id, u.user_id_code, u.username, u.email, u.fullName, u.passwordHash, u.avatar, u.bio]
-        );
-      }
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'stego_messages_attachment_id_fkey'
+            AND conrelid = 'stego_messages'::regclass
+        ) THEN
+          ALTER TABLE stego_messages
+            ADD CONSTRAINT stego_messages_attachment_id_fkey
+            FOREIGN KEY (attachment_id) REFERENCES attachments(id) ON DELETE CASCADE;
+        END IF;
 
-      // Seed accepted friendships
-      // Doris & Patrick are friends
-      await client.query(
-        `INSERT INTO friend_requests (id, sender_id, receiver_id, status)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (sender_id, receiver_id) DO NOTHING`,
-        ["fr_1", "u_patrick", "u_doris", "accepted"]
-      );
+        IF NOT EXISTS (
+          SELECT 1 FROM stego_messages WHERE attachment_id IS NULL
+        ) THEN
+          ALTER TABLE stego_messages
+            ALTER COLUMN attachment_id SET NOT NULL;
+        END IF;
+      END $$;
+    `);
 
-      // Doris & Mark are friends
-      await client.query(
-        `INSERT INTO friend_requests (id, sender_id, receiver_id, status)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (sender_id, receiver_id) DO NOTHING`,
-        ["fr_2", "u_mark", "u_doris", "accepted"]
-      );
-
-      // Seed initial messages matching screenshot
-      const initialMessages = [
-        {
-          id: "m_1",
-          senderId: "u_doris",
-          receiverId: "u_patrick",
-          content: "Good morning",
-          messageType: "text",
-          timestamp: new Date(Date.now() - 3600000),
-        },
-        {
-          id: "m_2",
-          senderId: "u_doris",
-          receiverId: "u_patrick",
-          content: "Yeah everything is fine",
-          messageType: "text",
-          timestamp: new Date(Date.now() - 3500000),
-        },
-        {
-          id: "m_3",
-          senderId: "u_doris",
-          receiverId: "u_patrick",
-          content: "& Next meeting tomorrow 10.00AM",
-          messageType: "text",
-          timestamp: new Date(Date.now() - 3400000),
-        },
-      ];
-
-      for (const m of initialMessages) {
-        await client.query(
-          `INSERT INTO messages (id, sender_id, receiver_id, content, message_type, timestamp)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (id) DO NOTHING`,
-          [m.id, m.senderId, m.receiverId, m.content, m.messageType, m.timestamp]
-        );
-      }
-
-      // Backup initial conversation to storage/chat
-      backupChatToFile("u_doris", "u_patrick", initialMessages);
-    }
+    await client.query(
+      `DELETE FROM users
+       WHERE id IN ('u_doris', 'u_patrick', 'u_steve', 'u_mark', 'u_emily')`
+    );
 
     console.log("PostgreSQL database initialized successfully.");
   } finally {

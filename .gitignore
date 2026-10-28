@@ -1,2 +1,7 @@
 venv312
 node_modules
+api/.venv
+api/__pycache__/
+server/.env
+server/.env.*
+!server/.env.example

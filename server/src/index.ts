@@ -2,56 +2,193 @@ import express from "express";
 import http from "http";
 import cors from "cors";
 import { WebSocketServer, WebSocket } from "ws";
-import path from "path";
 import crypto from "crypto";
 import multer from "multer";
-import fs from "fs";
+import jwt from "jsonwebtoken";
+import { promisify } from "util";
 
 import {
   pool,
   initDatabase,
   hashPassword,
   generateUserIdCode,
-  STORAGE_DIR,
-  CHAT_DIR,
-  IMAGES_DIR,
-  FILES_DIR,
-  backupChatToFile,
 } from "./db.js";
 
 const app = express();
-const PORT = 5000;
+const PORT = Number(process.env.PORT) || 5000;
 
 app.use(cors());
-app.use(express.json());
-
-// Serve uploaded files statically from storage/ folder
-app.use("/storage", express.static(STORAGE_DIR));
-
-// Multer Storage Configuration for Images and Files
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) {
-      cb(null, IMAGES_DIR);
-    } else {
-      cb(null, FILES_DIR);
-    }
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
-    const unique = `${Date.now()}_${crypto.randomUUID().slice(0, 6)}`;
-    cb(null, `${base}_${unique}${ext}`);
-  },
-});
+app.use(express.json({ limit: "14mb" }));
 
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB max
 });
 
 // WebSocket tracking: userId -> Set of WebSockets
 const userSockets = new Map<string, Set<WebSocket>>();
+
+class FaceRecognitionError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number
+  ) {
+    super(message);
+  }
+}
+
+class SteganographyError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number
+  ) {
+    super(message);
+  }
+}
+
+function getJwtSecret(): string | null {
+  const secret = process.env.JWT_SECRET;
+  return secret && Buffer.byteLength(secret, "utf8") >= 32 ? secret : null;
+}
+
+function createAccessToken(userId: string): string {
+  const secret = getJwtSecret();
+  if (!secret) {
+    throw new Error("JWT_SECRET must be configured with at least 32 bytes.");
+  }
+  return jwt.sign({}, secret, { subject: userId, issuer: "chatvia", expiresIn: "12h" });
+}
+
+const scrypt = promisify(crypto.scrypt);
+
+async function hashFriendshipSecret(secret: string, salt: Buffer): Promise<Buffer> {
+  return (await scrypt(secret, salt, 32)) as Buffer;
+}
+
+async function callSteganographyService(
+  endpoint: "embed" | "extract",
+  image: Buffer,
+  payload?: Buffer
+): Promise<Buffer> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${process.env.STEGANOGRAPHY_SERVICE_URL || "http://127.0.0.1:8001"}/stego/${endpoint}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image_base64: image.toString("base64"),
+          ...(payload ? { payload_base64: payload.toString("base64") } : {}),
+        }),
+        signal: AbortSignal.timeout(60_000),
+      }
+    );
+  } catch {
+    throw new SteganographyError("The steganography service is unavailable.", 503);
+  }
+
+  const result = (await response.json().catch(() => ({}))) as {
+    image_base64?: string;
+    payload_base64?: string;
+    detail?: string;
+  };
+  if (!response.ok) {
+    throw new SteganographyError(
+      result.detail || "The image could not be processed.",
+      response.status === 422 ? 422 : 503
+    );
+  }
+
+  const encoded = endpoint === "embed" ? result.image_base64 : result.payload_base64;
+  if (!encoded || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    throw new SteganographyError("The steganography service returned invalid data.", 503);
+  }
+  const data = Buffer.from(encoded, "base64");
+  if (!data.length || data.toString("base64") !== encoded) {
+    throw new SteganographyError("The steganography service returned invalid data.", 503);
+  }
+  return data;
+}
+
+function requireJwt(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const secret = getJwtSecret();
+  if (!secret) {
+    return res.status(503).json({ error: "JWT authentication is not configured." });
+  }
+
+  const authorization = req.header("Authorization");
+  const token = authorization?.startsWith("Bearer ") ? authorization.slice(7) : "";
+  if (!token) {
+    return res.status(401).json({ error: "Bearer token is required." });
+  }
+
+  try {
+    const payload = jwt.verify(token, secret, { issuer: "chatvia" });
+    if (typeof payload === "string" || typeof payload.sub !== "string") {
+      return res.status(401).json({ error: "Invalid authentication token." });
+    }
+    res.locals.userId = payload.sub;
+    return next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired authentication token." });
+  }
+}
+
+function getFaceEncryptionKey(): Buffer | null {
+  const encodedKey = process.env.FACE_ENCRYPTION_KEY;
+  if (!encodedKey || !/^[A-Za-z0-9+/]{43}=$/.test(encodedKey)) return null;
+
+  const key = Buffer.from(encodedKey, "base64");
+  return key.length === 32 && key.toString("base64") === encodedKey ? key : null;
+}
+
+async function extractFaceEmbedding(imageBase64: string): Promise<Buffer> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${process.env.FACE_SERVICE_URL || "http://127.0.0.1:8001"}/face/embedding`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_base64: imageBase64 }),
+        signal: AbortSignal.timeout(60_000),
+      }
+    );
+  } catch {
+    throw new FaceRecognitionError("Facial recognition service is unavailable.", 503);
+  }
+
+  const result = (await response.json().catch(() => ({}))) as {
+    embedding?: string;
+    detail?: string;
+  };
+  if (!response.ok) {
+    throw new FaceRecognitionError(
+      result.detail || "The face capture could not be processed.",
+      [400, 413, 422].includes(response.status) ? response.status : 503
+    );
+  }
+
+  if (!result.embedding || !/^[A-Za-z0-9+/]+={0,2}$/.test(result.embedding)) {
+    throw new FaceRecognitionError("Facial recognition returned an invalid template.", 503);
+  }
+
+  const embedding = Buffer.from(result.embedding, "base64");
+  if (
+    embedding.length === 0 ||
+    embedding.length > 16_384 ||
+    embedding.length % Float32Array.BYTES_PER_ELEMENT !== 0 ||
+    embedding.toString("base64") !== result.embedding
+  ) {
+    throw new FaceRecognitionError("Facial recognition returned an invalid template.", 503);
+  }
+  return embedding;
+}
 
 function isUserOnline(userId: string): boolean {
   const sockets = userSockets.get(userId);
@@ -92,24 +229,6 @@ async function areFriends(userId1: string, userId2: string): Promise<boolean> {
   return res.rows.length > 0;
 }
 
-// Helper: refresh JSON backup in storage/chat/
-async function syncChatBackup(user1: string, user2: string) {
-  try {
-    const res = await pool.query(
-      `SELECT id, sender_id AS "senderId", receiver_id AS "receiverId", content,
-              message_type AS "messageType", file_url AS "fileUrl", file_name AS "fileName",
-              file_size AS "fileSize", timestamp
-       FROM messages
-       WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)
-       ORDER BY timestamp ASC`,
-      [user1, user2]
-    );
-    backupChatToFile(user1, user2, res.rows);
-  } catch (err) {
-    console.error("Error backing up chat:", err);
-  }
-}
-
 // ---------------- REST API ROUTES ----------------
 
 app.get("/api/health", (_req, res) => {
@@ -118,9 +237,28 @@ app.get("/api/health", (_req, res) => {
 
 // 1. Register: requires username, email (Gmail ID), password
 app.post("/api/auth/register", async (req, res) => {
-  const { username, email, password, fullName, avatar, bio } = req.body;
+  const { username, email, password, fullName, avatar, bio, faceImage, faceConsent } = req.body;
   if (!username || !email || !password) {
     return res.status(400).json({ error: "Username, Gmail ID (email), and password are required." });
+  }
+  if (faceConsent !== true || typeof faceImage !== "string") {
+    return res.status(400).json({ error: "Face enrollment and consent are required to register." });
+  }
+  if (
+    faceImage.length > 3_000_000 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(faceImage)
+  ) {
+    return res.status(400).json({ error: "The face capture is invalid or too large." });
+  }
+  if (!getJwtSecret()) {
+    console.error("Registration is unavailable: JWT_SECRET must be configured with at least 32 bytes.");
+    return res.status(503).json({ error: "Registration is unavailable because authentication is not configured." });
+  }
+
+  const encryptionKey = getFaceEncryptionKey();
+  if (!encryptionKey) {
+    console.error("Registration is unavailable: FACE_ENCRYPTION_KEY must be a base64-encoded 32-byte key.");
+    return res.status(503).json({ error: "Registration is unavailable because face encryption is not configured." });
   }
 
   const cleanUsername = username.trim().toLowerCase();
@@ -136,22 +274,53 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(409).json({ error: "Username or Gmail ID already registered." });
     }
 
+    let embedding: Buffer;
+    try {
+      embedding = await extractFaceEmbedding(faceImage);
+    } catch (err) {
+      console.error("Face enrollment error:", err);
+      if (err instanceof FaceRecognitionError) {
+        return res.status(err.statusCode).json({ error: err.message });
+      }
+      return res.status(503).json({ error: "Facial recognition is temporarily unavailable." });
+    }
+
     const newId = `u_${crypto.randomUUID().slice(0, 8)}`;
     const userIdCode = generateUserIdCode();
     const pHash = hashPassword(password);
     const name = fullName?.trim() || cleanUsername;
     const userAvatar =
-      avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(cleanUsername)}`;
+      avatar ||
+      "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23e9e7ff'/%3E%3Ccircle cx='50' cy='38' r='18' fill='%237269ef'/%3E%3Cpath d='M15 100c2-24 16-36 35-36s33 12 35 36' fill='%237269ef'/%3E%3C/svg%3E";
     const userBio = bio?.trim() || "Hey there! I am using Chatvia.";
-
-    const insertRes = await pool.query(
-      `INSERT INTO users (id, user_id_code, username, email, full_name, password_hash, avatar, bio)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, user_id_code AS "userIdCode", username, email, full_name AS "fullName", avatar, bio`,
-      [newId, userIdCode, cleanUsername, cleanEmail, name, pHash, userAvatar, userBio]
-    );
-
-    const user = insertRes.rows[0];
+    const nonce = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey, nonce);
+    const ciphertext = Buffer.concat([cipher.update(embedding), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const client = await pool.connect();
+    let user;
+    try {
+      await client.query("BEGIN");
+      const insertRes = await client.query(
+        `INSERT INTO users (id, user_id_code, username, email, full_name, password_hash, avatar, bio)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, user_id_code AS "userIdCode", username, email, full_name AS "fullName", avatar, bio`,
+        [newId, userIdCode, cleanUsername, cleanEmail, name, pHash, userAvatar, userBio]
+      );
+      user = insertRes.rows[0];
+      await client.query(
+        `INSERT INTO face_biometrics
+           (user_id, template_ciphertext, nonce, auth_tag, algorithm, consented_at)
+         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
+        [newId, ciphertext, nonce, authTag, "InspireFace-Pikachu"]
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
 
     broadcastGlobal({
       type: "user_registered",
@@ -164,7 +333,7 @@ app.post("/api/auth/register", async (req, res) => {
       },
     });
 
-    return res.json({ user });
+    return res.json({ user, token: createAccessToken(user.id) });
   } catch (err: any) {
     console.error("Register error:", err);
     return res.status(500).json({ error: "Registration failed on server." });
@@ -176,6 +345,9 @@ app.post("/api/auth/login", async (req, res) => {
   const { username, email, password } = req.body;
   if (!password || (!username && !email)) {
     return res.status(400).json({ error: "Username/Gmail ID and password are required." });
+  }
+  if (!getJwtSecret()) {
+    return res.status(503).json({ error: "Authentication is not configured." });
   }
 
   try {
@@ -204,7 +376,7 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     delete user.password_hash;
-    return res.json({ user });
+    return res.json({ user, token: createAccessToken(user.id) });
   } catch (err: any) {
     console.error("Login error:", err);
     return res.status(500).json({ error: "Login failed on server." });
@@ -457,6 +629,123 @@ app.post("/api/friends/respond", async (req, res) => {
   }
 });
 
+app.get("/api/friends/:friendId/secure-key", requireJwt, async (req, res) => {
+  const userId = res.locals.userId as string;
+  try {
+    const friendship = await pool.query(
+      `SELECT fr.id, fs.salt, fs.set_by, fs.confirmed_by
+       FROM friend_requests fr
+       LEFT JOIN friendship_secrets fs ON fs.friendship_id = fr.id
+       WHERE fr.status = 'accepted'
+         AND ((fr.sender_id = $1 AND fr.receiver_id = $2)
+           OR (fr.sender_id = $2 AND fr.receiver_id = $1))`,
+      [userId, req.params.friendId]
+    );
+    if (friendship.rows.length === 0) {
+      return res.status(403).json({ error: "Secure keys are available only to accepted friends." });
+    }
+
+    const key = friendship.rows[0];
+    const configured = Boolean(key.set_by);
+    const setByMe = key.set_by === userId;
+    const ready = configured && (setByMe || Boolean(key.confirmed_by));
+    return res.json({
+      configured,
+      ready,
+      setByMe,
+      confirmedByMe: key.confirmed_by === userId,
+      salt: configured ? Buffer.from(key.salt).toString("base64") : null,
+    });
+  } catch (err) {
+    console.error("Friendship key status error:", err);
+    return res.status(500).json({ error: "Failed to fetch secure key status." });
+  }
+});
+
+app.put("/api/friends/:friendId/secure-key", requireJwt, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const secret = req.body.secret;
+  if (typeof secret !== "string" || secret.trim().length < 12 || secret.length > 256) {
+    return res.status(400).json({ error: "Use a shared passphrase between 12 and 256 characters." });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const friendship = await client.query(
+      `SELECT id FROM friend_requests
+       WHERE status = 'accepted'
+         AND ((sender_id = $1 AND receiver_id = $2)
+           OR (sender_id = $2 AND receiver_id = $1))
+       FOR UPDATE`,
+      [userId, req.params.friendId]
+    );
+    if (friendship.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Secure keys are available only to accepted friends." });
+    }
+
+    const friendshipId = friendship.rows[0].id as string;
+    const existing = await client.query(
+      `SELECT salt, secret_hash, set_by, confirmed_by
+       FROM friendship_secrets WHERE friendship_id = $1 FOR UPDATE`,
+      [friendshipId]
+    );
+
+    if (existing.rows.length === 0) {
+      const salt = crypto.randomBytes(16);
+      const secretHash = await hashFriendshipSecret(secret, salt);
+      await client.query(
+        `INSERT INTO friendship_secrets (friendship_id, salt, secret_hash, set_by)
+         VALUES ($1, $2, $3, $4)`,
+        [friendshipId, salt, secretHash, userId]
+      );
+      await client.query("COMMIT");
+      return res.json({
+        ready: true,
+        setByMe: true,
+        salt: salt.toString("base64"),
+        message: "Shared passphrase saved. You can send secure messages now; your friend can confirm the same passphrase when ready.",
+      });
+    }
+
+    const stored = existing.rows[0];
+    if (stored.confirmed_by) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This friendship already has a confirmed shared key." });
+    }
+    if (stored.set_by === userId) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Waiting for your friend to confirm the shared passphrase." });
+    }
+
+    const suppliedHash = await hashFriendshipSecret(secret, Buffer.from(stored.salt));
+    if (!crypto.timingSafeEqual(suppliedHash, Buffer.from(stored.secret_hash))) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "That passphrase does not match your friend's key." });
+    }
+
+    await client.query(
+      `UPDATE friendship_secrets
+       SET confirmed_by = $2, confirmed_at = CURRENT_TIMESTAMP
+       WHERE friendship_id = $1`,
+      [friendshipId, userId]
+    );
+    await client.query("COMMIT");
+    return res.json({
+      ready: true,
+      salt: Buffer.from(stored.salt).toString("base64"),
+      message: "Shared passphrase confirmed. Use it to encrypt and decrypt secure messages.",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Friendship key setup error:", err);
+    return res.status(500).json({ error: "Failed to set up the shared passphrase." });
+  } finally {
+    client.release();
+  }
+});
+
 // 8. Get Friends & Pending Requests
 app.get("/api/friends", async (req, res) => {
   const userId = req.query.userId as string;
@@ -535,28 +824,88 @@ app.get("/api/friends", async (req, res) => {
   }
 });
 
-// 9. File & Image Upload endpoint (stores in storage/images/ or storage/files/)
-app.post("/api/upload", upload.single("file"), (req, res) => {
+// 9. File & Image Upload endpoint (stores file data in PostgreSQL)
+app.post("/api/upload", upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No file was uploaded." });
   }
+  const userId = req.body.userId as string | undefined;
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required." });
+  }
 
   const isImage = req.file.mimetype.startsWith("image/");
-  const subFolder = isImage ? "images" : "files";
-  const fileUrl = `/storage/${subFolder}/${req.file.filename}`;
+  const formattedSize =
+    req.file.size > 1024 * 1024
+      ? `${(req.file.size / (1024 * 1024)).toFixed(1)} MB`
+      : req.file.size > 1024
+        ? `${(req.file.size / 1024).toFixed(1)} KB`
+        : `${req.file.size} B`;
+  const attachmentId = crypto.randomUUID();
 
-  // Human readable file size (e.g. 2.4 MB)
-  const bytes = req.file.size;
-  let formattedSize = `${bytes} B`;
-  if (bytes > 1024 * 1024) formattedSize = `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  else if (bytes > 1024) formattedSize = `${(bytes / 1024).toFixed(1)} KB`;
+  try {
+    const userRes = await pool.query("SELECT id FROM users WHERE id = $1", [userId]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: "User not found." });
+    }
 
-  res.json({
-    fileUrl,
-    fileName: req.file.originalname,
-    fileSize: formattedSize,
-    messageType: isImage ? "image" : "file",
-  });
+    await pool.query(
+      `INSERT INTO attachments (id, owner_id, file_name, content_type, file_data, file_size)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        attachmentId,
+        userId,
+        req.file.originalname,
+        req.file.mimetype,
+        req.file.buffer,
+        req.file.size,
+      ]
+    );
+
+    return res.json({
+      fileUrl: `/api/files/${attachmentId}`,
+      fileName: req.file.originalname,
+      fileSize: formattedSize,
+      messageType: isImage ? "image" : "file",
+    });
+  } catch (err) {
+    console.error("File upload error:", err);
+    return res.status(500).json({ error: "Failed to save uploaded file." });
+  }
+});
+
+app.get("/api/files/:id", async (req, res) => {
+  const userId = req.query.userId as string | undefined;
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required." });
+  }
+
+  try {
+    const fileRes = await pool.query(
+      `SELECT a.file_data, a.content_type AS "contentType", a.file_name AS "fileName",
+              m.message_type AS "messageType"
+       FROM attachments a
+       JOIN messages m ON m.file_url = '/api/files/' || a.id
+       WHERE a.id = $1 AND ($2 = m.sender_id OR $2 = m.receiver_id)
+       LIMIT 1`,
+      [req.params.id, userId]
+    );
+    if (fileRes.rows.length === 0) {
+      return res.status(404).json({ error: "File not found." });
+    }
+
+    const file = fileRes.rows[0];
+    res.setHeader("Content-Type", file.contentType);
+    res.setHeader(
+      "Content-Disposition",
+      `${file.messageType === "image" ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(file.fileName)}`
+    );
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    return res.send(file.file_data);
+  } catch (err) {
+    console.error("File retrieval error:", err);
+    return res.status(500).json({ error: "Failed to retrieve file." });
+  }
 });
 
 // 10. Get Messages (Gated by friendship)
@@ -582,10 +931,12 @@ app.get("/api/messages", async (req, res) => {
     const msgRes = await pool.query(
       `SELECT id, sender_id AS "senderId", receiver_id AS "receiverId", content,
               message_type AS "messageType", file_url AS "fileUrl", file_name AS "fileName",
-              file_size AS "fileSize", timestamp
-       FROM messages
-       WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)
-       ORDER BY timestamp ASC`,
+              file_size AS "fileSize", is_secure AS "isSecure",
+              COALESCE(sm.consumed_at IS NOT NULL, FALSE) AS "secureConsumed", m.timestamp
+       FROM messages m
+       LEFT JOIN stego_messages sm ON sm.message_id = m.id
+       WHERE (m.sender_id = $1 AND m.receiver_id = $2) OR (m.sender_id = $2 AND m.receiver_id = $1)
+       ORDER BY m.timestamp ASC`,
       [u1, u2]
     );
 
@@ -595,7 +946,202 @@ app.get("/api/messages", async (req, res) => {
   }
 });
 
-// 11. Send Message via REST (Gated by friendship, saves to PostgreSQL + storage/chat/)
+app.post("/api/secure/messages", requireJwt, async (req, res) => {
+  const senderId = res.locals.userId as string;
+  const { friendId, imageBase64, payloadBase64 } = req.body as {
+    friendId?: string;
+    imageBase64?: string;
+    payloadBase64?: string;
+  };
+  if (
+    typeof friendId !== "string" ||
+    typeof imageBase64 !== "string" ||
+    typeof payloadBase64 !== "string" ||
+    imageBase64.length > 11_200_000 ||
+    payloadBase64.length > 1_400_000 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(imageBase64) ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(payloadBase64)
+  ) {
+    return res.status(400).json({ error: "A PNG and encrypted message are required." });
+  }
+
+  const image = Buffer.from(imageBase64, "base64");
+  const payload = Buffer.from(payloadBase64, "base64");
+  if (
+    image.length === 0 ||
+    image.length > 8 * 1024 * 1024 ||
+    image.toString("base64") !== imageBase64 ||
+    payload.length === 0 ||
+    payload.length > 1_000_000 ||
+    payload.toString("base64") !== payloadBase64
+  ) {
+    return res.status(400).json({ error: "The PNG or encrypted message is invalid or too large." });
+  }
+
+  try {
+    const friendshipRes = await pool.query(
+      `SELECT fr.id
+       FROM friend_requests fr
+       JOIN friendship_secrets fs ON fs.friendship_id = fr.id
+       WHERE fr.status = 'accepted'
+         AND ((fr.sender_id = $1 AND fr.receiver_id = $2)
+           OR (fr.sender_id = $2 AND fr.receiver_id = $1))`,
+      [senderId, friendId]
+    );
+    if (friendshipRes.rows.length === 0) {
+      return res.status(403).json({ error: "Confirm the shared passphrase with this friend first." });
+    }
+
+    const stegoImage = await callSteganographyService("embed", image, payload);
+    const messageId = `m_${crypto.randomUUID().slice(0, 12)}`;
+    const attachmentId = crypto.randomUUID();
+    const client = await pool.connect();
+    let message;
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO attachments (id, owner_id, file_name, content_type, file_data, file_size)
+         VALUES ($1, $2, $3, 'image/png', $4, $5)`,
+        [attachmentId, senderId, `${messageId}.png`, stegoImage, stegoImage.length]
+      );
+      const messageRes = await client.query(
+        `INSERT INTO messages
+           (id, sender_id, receiver_id, content, message_type, file_url, file_name, file_size, is_secure)
+         VALUES ($1, $2, $3, 'Encrypted image message', 'image', $4, $5, $6, TRUE)
+         RETURNING id, sender_id AS "senderId", receiver_id AS "receiverId", content,
+                   message_type AS "messageType", file_url AS "fileUrl", file_name AS "fileName",
+                   file_size AS "fileSize", is_secure AS "isSecure", timestamp`,
+        [
+          messageId,
+          senderId,
+          friendId,
+          `/api/secure/messages/${messageId}/image`,
+          `${messageId}.png`,
+          `${(stegoImage.length / 1024).toFixed(1)} KB`,
+        ]
+      );
+      message = messageRes.rows[0];
+      await client.query(
+        "INSERT INTO stego_messages (message_id, attachment_id, original_png) VALUES ($1, $2, $3)",
+        [messageId, attachmentId, image]
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    broadcastToUser(friendId, { type: "new_message", message });
+    broadcastToUser(senderId, { type: "new_message", message });
+    return res.json({ message });
+  } catch (err) {
+    console.error("Secure message send error:", err);
+    const message = err instanceof Error ? err.message : "Failed to send secure image.";
+    const statusCode = err instanceof SteganographyError ? err.statusCode : 500;
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.get("/api/secure/messages/:id/image", requireJwt, async (req, res) => {
+  const userId = res.locals.userId as string;
+  try {
+    const imageRes = await pool.query(
+      `SELECT a.file_data
+       FROM messages m
+       JOIN stego_messages sm ON sm.message_id = m.id
+       JOIN attachments a ON a.id = sm.attachment_id
+       WHERE m.id = $1 AND m.is_secure = TRUE
+         AND ($2 = m.sender_id OR $2 = m.receiver_id)`,
+      [req.params.id, userId]
+    );
+    if (imageRes.rows.length === 0) {
+      return res.status(404).json({ error: "Secure image not found." });
+    }
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    return res.send(imageRes.rows[0].file_data);
+  } catch (err) {
+    console.error("Secure image fetch error:", err);
+    return res.status(500).json({ error: "Failed to retrieve secure image." });
+  }
+});
+
+app.post("/api/secure/messages/:id/payload", requireJwt, async (req, res) => {
+  const receiverId = res.locals.userId as string;
+  try {
+    const imageRes = await pool.query(
+      `SELECT a.file_data
+       FROM messages m
+       JOIN stego_messages sm ON sm.message_id = m.id AND sm.consumed_at IS NULL
+       JOIN attachments a ON a.id = sm.attachment_id
+       JOIN friend_requests fr ON fr.status = 'accepted'
+         AND ((fr.sender_id = m.sender_id AND fr.receiver_id = m.receiver_id)
+           OR (fr.sender_id = m.receiver_id AND fr.receiver_id = m.sender_id))
+       JOIN friendship_secrets fs ON fs.friendship_id = fr.id AND fs.confirmed_at IS NOT NULL
+       WHERE m.id = $1 AND m.receiver_id = $2 AND m.is_secure = TRUE`,
+      [req.params.id, receiverId]
+    );
+    if (imageRes.rows.length === 0) {
+      return res.status(410).json({ error: "This secure message has already been viewed or is unavailable." });
+    }
+
+    const payload = await callSteganographyService(
+      "extract",
+      Buffer.from(imageRes.rows[0].file_data)
+    );
+    return res.json({ payloadBase64: payload.toString("base64") });
+  } catch (err) {
+    console.error("Secure message extraction error:", err);
+    const message = err instanceof Error ? err.message : "Failed to extract secure message.";
+    const statusCode = err instanceof SteganographyError ? err.statusCode : 500;
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.post("/api/secure/messages/:id/consume", requireJwt, async (req, res) => {
+  const receiverId = res.locals.userId as string;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const secureMessage = await client.query(
+      `SELECT sm.attachment_id, sm.original_png
+       FROM messages m
+       JOIN stego_messages sm ON sm.message_id = m.id AND sm.consumed_at IS NULL
+       WHERE m.id = $1 AND m.receiver_id = $2 AND m.is_secure = TRUE
+         AND sm.original_png IS NOT NULL
+       FOR UPDATE OF sm`,
+      [req.params.id, receiverId]
+    );
+    if (secureMessage.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(410).json({ error: "This secure message has already been viewed or is unavailable." });
+    }
+
+    const originalPng = Buffer.from(secureMessage.rows[0].original_png);
+    await client.query(
+      `UPDATE attachments SET file_data = $1, file_size = $2
+       WHERE id = $3`,
+      [originalPng, originalPng.length, secureMessage.rows[0].attachment_id]
+    );
+    await client.query(
+      "UPDATE stego_messages SET original_png = NULL, consumed_at = CURRENT_TIMESTAMP WHERE message_id = $1",
+      [req.params.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ consumed: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Secure message consume error:", err);
+    return res.status(500).json({ error: "Failed to restore the original image." });
+  } finally {
+    client.release();
+  }
+});
+
+// 11. Send Message via REST (Gated by friendship, saves to PostgreSQL)
 app.post("/api/messages", async (req, res) => {
   const { senderId, receiverId, content, messageType, fileUrl, fileName, fileSize } = req.body;
   if (!senderId || !receiverId) {
@@ -623,9 +1169,6 @@ app.post("/api/messages", async (req, res) => {
 
     const newMessage = insertRes.rows[0];
 
-    // Backup to storage/chat/
-    await syncChatBackup(senderId, receiverId);
-
     // Broadcast in real-time
     broadcastToUser(receiverId, { type: "new_message", message: newMessage });
     broadcastToUser(senderId, { type: "new_message", message: newMessage });
@@ -642,24 +1185,33 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws, req) => {
-  const url = new URL(req.url || "", `http://${req.headers.host}`);
-  const userId = url.searchParams.get("userId");
-
-  if (!userId) {
-    ws.close(1008, "User ID missing");
-    return;
-  }
-
-  if (!userSockets.has(userId)) {
-    userSockets.set(userId, new Set());
-  }
-  userSockets.get(userId)!.add(ws);
-
-  broadcastGlobal({ type: "user_status", userId, online: true });
+  let userId: string | null = null;
+  const authTimeout = setTimeout(() => ws.close(1008, "Authentication required"), 10_000);
 
   ws.on("message", async (raw) => {
     try {
       const data = JSON.parse(raw.toString());
+      if (!userId) {
+        const secret = getJwtSecret();
+        if (data.type !== "authenticate" || typeof data.token !== "string" || !secret) {
+          ws.close(1008, "Valid authentication token required");
+          return;
+        }
+
+        const payload = jwt.verify(data.token, secret, { issuer: "chatvia" });
+        if (typeof payload === "string" || typeof payload.sub !== "string") {
+          ws.close(1008, "Invalid authentication token");
+          return;
+        }
+        userId = payload.sub;
+        clearTimeout(authTimeout);
+        if (!userSockets.has(userId)) {
+          userSockets.set(userId, new Set());
+        }
+        userSockets.get(userId)!.add(ws);
+        broadcastGlobal({ type: "user_status", userId, online: true });
+        return;
+      }
 
       if (data.type === "send_message") {
         const { receiverId, content, messageType, fileUrl, fileName, fileSize } = data;
@@ -691,9 +1243,6 @@ wss.on("connection", (ws, req) => {
 
         const newMessage = insertRes.rows[0];
 
-        // Backup to storage/chat/
-        await syncChatBackup(userId, receiverId);
-
         // Send to receiver & echo to sender
         broadcastToUser(receiverId, { type: "new_message", message: newMessage });
         broadcastToUser(userId, { type: "new_message", message: newMessage });
@@ -713,6 +1262,8 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
+    clearTimeout(authTimeout);
+    if (!userId) return;
     const sockets = userSockets.get(userId);
     if (sockets) {
       sockets.delete(ws);
@@ -730,7 +1281,6 @@ initDatabase()
     server.listen(PORT, () => {
       console.log(`Chatvia Server running on http://localhost:${PORT}`);
       console.log(`WebSocket running on ws://localhost:${PORT}/ws`);
-      console.log(`Storage root: ${STORAGE_DIR} (chat, images, files, avatars)`);
     });
   })
   .catch((err) => {

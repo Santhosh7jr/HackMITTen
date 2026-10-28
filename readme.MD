@@ -1,95 +1,72 @@
 # Chatvia - Real-Time Multi-User Chat Application
 
-A modern real-time chat application inspired by the **Chatvia** React UI template built with **React + TypeScript + Vite** frontend, **Node.js + Express + WebSockets** backend, and **PostgreSQL** database.
+Chatvia is a real-time chat application built with React, TypeScript, Vite, Express, WebSockets, PostgreSQL, and a Python facial-enrollment service using OpenCV, NumPy, and InspireFace.
 
----
+## Features
 
-## 🌟 Key Features
+- PostgreSQL stores account profiles, friend requests, messages, and uploaded file contents.
+- Uploaded images and documents are stored as PostgreSQL `BYTEA` attachments, with a 25 MB per-file limit.
+- Friend requests use User IDs; profiles are only revealed when a User ID is searched.
+- Real-time messaging and notifications are available to accepted friends.
+- Profiles can be edited after signing in.
+- Registration requires camera capture and explicit consent. InspireFace checks for exactly one face and creates a recognition template; the raw camera image is not stored. Enrollment is not liveness detection or identity verification.
+- Face templates are encrypted with AES-256-GCM before being stored in PostgreSQL. Keep `FACE_ENCRYPTION_KEY` secret and back it up securely; losing it makes stored templates unreadable.
+- Secure image messages use a per-friend shared passphrase, client-side AES-GCM encryption, and randomized PNG LSB steganography. PostgreSQL stores the stego image and the exact original PNG; after the recipient decrypts successfully, the stored image is restored and the saved original is cleared.
+- The shared passphrase is never stored in plaintext or placed in a JWT. PostgreSQL keeps a salted scrypt verifier; JWTs authenticate secure-message requests.
 
-1. **PostgreSQL Database**:
-   - Stores users, friend requests, and messages with relational integrity.
-   - Host: `localhost:5432` | User: `postgres` | Password: `help` | Database: `postgres`.
+## Run locally
 
-2. **Dedicated Storage Folders**:
-   - All uploaded and conversation data is organized in structured folders under `server/storage/`:
-     - `server/storage/chat/`: Automatic JSON conversation history files (`chat_{user1}_{user2}.json`).
-     - `server/storage/images/`: Uploaded image attachments (`.png, .jpg, .gif, .webp`).
-     - `server/storage/files/`: Uploaded documents and files (`.zip, .pdf, .docx, .txt`).
-     - `server/storage/avatars/`: Profile avatars.
+The backend loads its configuration from `server/.env`. A local, ignored `.env` file is provided for this checkout; for a fresh clone, copy the template and generate the two secrets once:
 
-3. **Privacy-Preserving User ID Lookup**:
-   - *"Do not show the user name until they enter the user id"*:
-   - Usernames and profiles are hidden from public listing until a user enters the exact **User ID** (e.g. `UID-7001`, `UID-7002`).
-   - Entering a User ID reveals the user's card and enables sending a friend request.
+```powershell
+cd server
+if (Test-Path .env) { throw "server/.env already exists; keep the existing keys." }
+Copy-Item .env.example .env
+$jwtBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($jwtBytes)
+$faceBytes = [byte[]]::new(32)
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($faceBytes)
+$envFile = [System.IO.File]::ReadAllText((Join-Path $PWD ".env"))
+$envFile = $envFile.Replace("replace-with-a-private-random-secret-at-least-32-bytes", [Convert]::ToBase64String($jwtBytes))
+$envFile = $envFile.Replace("replace-with-base64-encoded-32-byte-key", [Convert]::ToBase64String($faceBytes))
+[System.IO.File]::WriteAllText((Join-Path $PWD ".env"), $envFile, [System.Text.UTF8Encoding]::new($false))
+```
 
-4. **Structured User Profile**:
-   - Clean profile card displaying avatar with online dot, Full Name, and bio.
-   - **User ID Chip** (e.g. `UID-7001`) with a 1-click **Copy ID** button to easily share with friends.
-   - Information list: Username (`@doris`), Gmail ID (`doris@gmail.com`), Database status, and Storage info.
-   - **Edit Profile** feature to update Full Name and Bio.
+Set `PG_PASSWORD` in `server/.env` to your PostgreSQL password. Keep both generated keys private and unchanged across restarts; changing them invalidates login tokens or makes existing face templates unreadable. `.env` is ignored by Git. The server creates the required tables and migrates older secure-message schemas on startup.
 
-5. **Emojis and File/Image Sending**:
-   - **Emoji Picker**: Interactive popover with 28+ categorized emojis (Smileys, gestures, hearts, celebration).
-   - **Image Attachment (📷)**: Uploads images to `storage/images/` and displays rich preview bubbles.
-   - **File Attachment (📎)**: Uploads documents/archives to `storage/files/` and displays downloadable file cards with file name and size.
+In a second terminal, install and start the facial-enrollment and steganography service:
 
-6. **Friend-Gated Messaging**:
-   - Direct messaging is strictly restricted to accepted friends.
-   - Real-time WebSocket notifications for friend requests, message delivery, and typing indicators.
+```powershell
+cd api
+if (-not (Test-Path .venv)) { uv venv --python 3.12 .venv }
+uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
+.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8001
+```
 
-7. **Split-Screen Demo Mode**:
-   - Click the **⚡ icon** on the left rail to view two users (e.g. Doris and Patrick) chatting side-by-side in real time!
+Use Python 3.12 for this service because InspireFace does not publish compatible wheels for every Python version.
 
----
+The service downloads InspireFace's model on first use. The upstream project states its models are for academic use only and prohibit commercial applications; confirm the current license and platform requirements before deployment.
 
-## 🚀 How to Run Manually
+Start the backend in the first terminal, from the `server` directory so `.env` is loaded:
 
-### 1. Start the Server (Backend)
-```bash
+```powershell
 cd server
 npm install
 npm run dev
 ```
-> Runs at `http://localhost:5000` with WebSocket at `ws://localhost:5000/ws`.
 
-### 2. Start the Client (Frontend)
-```bash
+The backend runs at `http://localhost:5000` with WebSockets at `ws://localhost:5000/ws`.
+
+Start the frontend in a third terminal:
+
+```powershell
 cd client
 npm install
 npm run dev
 ```
-> Runs at `http://localhost:5173`.
 
----
+The frontend runs at `http://localhost:5173`. Create an account with **Sign Up** to get started. Signing out or refreshing the page requires signing in again; account and chat data remain in PostgreSQL.
 
-## 🔑 Pre-Seeded Demo Accounts
+To send a secure image message, select **Secure image + text**, set a shared passphrase with a friend, and have the other friend confirm the same passphrase. Choose a PNG and enter the text; the encrypted payload is hidden in the PNG before it is saved. The recipient must enter the passphrase and select **Decrypt once**. A wrong passphrase does not consume the message. After a successful decrypt, the application restores the original PNG in PostgreSQL and removes the saved recovery copy.
 
-| Full Name | User ID | Username | Gmail ID / Email | Password |
-| :--- | :--- | :--- | :--- | :--- |
-| **Doris Brown** | `UID-7001` | `doris` | `doris@gmail.com` | `doris123` |
-| **Patrick Hendricks** | `UID-7002` | `patrick` | `patrick@gmail.com` | `patrick123` |
-| **Steve Walker** | `UID-7004` | `steve` | `steve@gmail.com` | `steve123` |
-| **Mark Messer** | `UID-7003` | `mark` | `mark@gmail.com` | `mark123` |
-| **Emily Clark** | `UID-7005` | `emily` | `emily@gmail.com` | `emily123` |
-
-*(You can also click **Sign Up** to create any new account with custom username, Gmail ID, and password).*
-
----
-
-## 👥 How to Test User ID Connect & File Sending
-
-### 1. Connecting via User ID:
-1. Log in as **Doris Brown** (`UID-7001`).
-2. Click the **👥 Friends** tab on the left rail.
-3. In the **"Find User by User ID"** box, type `UID-7004` (Steve Walker) and click **"Search ID"**.
-4. Steve's profile is revealed with his name, `@steve`, and avatar.
-5. Click **"+ Send Friend Request"**.
-6. In another tab or window, log in as Steve (`steve` / `steve@gmail.com` / `steve123`), open the **👥 Friends** tab, and click **"Accept"**.
-7. They now appear in each other's **Chats** list!
-
-### 2. Sending Emojis and Files:
-1. Open the chat with your friend.
-2. Click **😊** to open the emoji picker and select emojis.
-3. Click **📷** to upload and send an image (saved to `server/storage/images/`).
-4. Click **📎** to upload and send any document or zip file (saved to `server/storage/files/`).
-5. Check `server/storage/chat/` to see the conversation backup transcript automatically updated!
+Restoration and removal are logical database operations, not a guarantee of forensic erasure: PostgreSQL write-ahead logs, replicas, or backups may retain earlier data until their retention policies expire.
