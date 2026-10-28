@@ -1,1 +1,111 @@
-@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --font-family: 'Public Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+  /* Chatvia Theme Colors */
+  --primary-color: #7269ef;
+  --primary-hover: #6159cb;
+  --primary-light: rgba(114, 105, 239, 0.12);
+  --primary-border: rgba(114, 105, 239, 0.25);
+
+  --bg-app: #f5f7fb;
+  --bg-sidebar: #ffffff;
+  --bg-chat: #ffffff;
+  --bg-input: #e6ebf5;
+  --bg-card: #ffffff;
+  
+  --nav-rail-bg: #ffffff;
+  --nav-rail-border: #f0f2f7;
+
+  --border-color: #f0f2f7;
+  --border-light: #e6ebf5;
+
+  --text-primary: #343a40;
+  --text-secondary: #7a7f9a;
+  --text-muted: #abb4d2;
+  
+  --bubble-received-bg: #f5f7fb;
+  --bubble-received-text: #343a40;
+  --bubble-sent-bg: #7269ef;
+  --bubble-sent-text: #ffffff;
+
+  --badge-online: #06d6a0;
+  --badge-offline: #a0aec0;
+  --badge-danger: #ef476f;
+  --badge-warning: #ffd166;
+
+  --shadow-sm: 0 2px 4px rgba(15, 34, 58, 0.06);
+  --shadow-md: 0 4px 12px rgba(15, 34, 58, 0.08);
+  --shadow-lg: 0 10px 25px rgba(15, 34, 58, 0.12);
+}
+
+/* Dark Mode Variables */
+[data-theme='dark'] {
+  --bg-app: #262e35;
+  --bg-sidebar: #303841;
+  --bg-chat: #262e35;
+  --bg-input: #36404a;
+  --bg-card: #303841;
+
+  --nav-rail-bg: #36404a;
+  --nav-rail-border: #3b4550;
+
+  --border-color: #36404a;
+  --border-light: #3e4853;
+
+  --text-primary: #eff2f7;
+  --text-secondary: #abb4d2;
+  --text-muted: #7a7f9a;
+
+  --bubble-received-bg: #36404a;
+  --bubble-received-text: #eff2f7;
+  --bubble-sent-bg: #7269ef;
+  --bubble-sent-text: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  font-family: var(--font-family);
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  height: 100%;
+  width: 100%;
+  display: flex;
+}
+
+button {
+  font-family: inherit;
+}
+
+input, textarea {
+  font-family: inherit;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(171, 180, 210, 0.35);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(171, 180, 210, 0.6);
+}

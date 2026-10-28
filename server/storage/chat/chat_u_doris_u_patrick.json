@@ -1,0 +1,90 @@
+[
+  {
+    "id": "m_1",
+    "senderId": "u_doris",
+    "receiverId": "u_patrick",
+    "content": "Good morning",
+    "messageType": "text",
+    "fileUrl": null,
+    "fileName": null,
+    "fileSize": null,
+    "timestamp": "2026-10-28T11:47:11.712Z"
+  },
+  {
+    "id": "m_2",
+    "senderId": "u_doris",
+    "receiverId": "u_patrick",
+    "content": "Yeah everything is fine",
+    "messageType": "text",
+    "fileUrl": null,
+    "fileName": null,
+    "fileSize": null,
+    "timestamp": "2026-10-28T11:47:11.712Z"
+  },
+  {
+    "id": "m_3",
+    "senderId": "u_doris",
+    "receiverId": "u_patrick",
+    "content": "& Next meeting tomorrow 10.00AM",
+    "messageType": "text",
+    "fileUrl": null,
+    "fileName": null,
+    "fileSize": null,
+    "timestamp": "2026-10-28T11:47:11.712Z"
+  },
+  {
+    "id": "m_da546d2d",
+    "senderId": "u_doris",
+    "receiverId": "u_patrick",
+    "content": "Look at this design mockup",
+    "messageType": "image",
+    "fileUrl": "/storage/images/tmpB9A4_tmp_1793189264652_aa4224.png",
+    "fileName": "mockup.png",
+    "fileSize": "8 B",
+    "timestamp": "2026-10-28T12:08:25.921Z"
+  },
+  {
+    "id": "m_9dd9e903",
+    "senderId": "u_patrick",
+    "receiverId": "u_doris",
+    "content": "😀",
+    "messageType": "text",
+    "fileUrl": null,
+    "fileName": null,
+    "fileSize": null,
+    "timestamp": "2026-10-28T13:03:46.591Z"
+  },
+  {
+    "id": "m_4818b46c",
+    "senderId": "u_patrick",
+    "receiverId": "u_doris",
+    "content": "Photo",
+    "messageType": "image",
+    "fileUrl": "/storage/images/Screenshot_2026-10-24_132613_1793192792448_6c2927.png",
+    "fileName": "Screenshot 2026-10-24 132613.png",
+    "fileSize": "86.1 KB",
+    "timestamp": "2026-10-28T13:06:32.508Z"
+  },
+  {
+    "id": "m_6495c281",
+    "senderId": "u_patrick",
+    "receiverId": "u_doris",
+    "content": "HI I am santhosh 🙄",
+    "messageType": "text",
+    "fileUrl": null,
+    "fileName": null,
+    "fileSize": null,
+    "timestamp": "2026-10-28T13:06:35.124Z"
+  },
+  {
+    "id": "m_b7f9b54f",
+    "senderId": "u_doris",
+    "receiverId": "u_patrick",
+    "content": "Suhas Admi.pdf",
+    "messageType": "file",
+    "fileUrl": "/storage/files/Suhas_Admi_1793192831035_3811c8.pdf",
+    "fileName": "Suhas Admi.pdf",
+    "fileSize": "76.5 KB",
+    "timestamp": "2026-10-28T13:07:11.221Z"
+  }
+]
