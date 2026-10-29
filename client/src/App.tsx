@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import './App.css';
 
 interface User {
@@ -33,7 +33,52 @@ interface SecureKeyStatus {
   ready: boolean;
   setByMe: boolean;
   confirmedByMe: boolean;
+  confirmed: boolean;
   salt: string | null;
+}
+
+function openSecureKeyDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('cryptchat-secure-keys', 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore('keys');
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('Could not open secure key storage.'));
+    request.onblocked = () => reject(new Error('Secure key storage is blocked by another tab.'));
+  });
+}
+
+async function loadCachedSecureKey(cacheId: string): Promise<CryptoKey | null> {
+  const database = await openSecureKeyDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = database.transaction('keys', 'readonly').objectStore('keys').get(cacheId);
+      request.onsuccess = () => resolve((request.result as CryptoKey | undefined) ?? null);
+      request.onerror = () => reject(request.error ?? new Error('Could not load the saved secure key.'));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function saveCachedSecureKey(cacheId: string, key: CryptoKey): Promise<void> {
+  const database = await openSecureKeyDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction('keys', 'readwrite');
+      transaction.objectStore('keys').put(key, cacheId);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error ?? new Error('Could not save the secure key.'));
+      transaction.onabort = () => reject(transaction.error ?? new Error('Secure key storage was interrupted.'));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function secureKeyCacheId(userId: string, friendId: string, salt: string): string {
+  return `${userId}:${friendId}:${salt}`;
 }
 
 interface FriendRequestItem {
@@ -101,6 +146,66 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return buffer;
 }
 
+async function captureCameraFrame(stream: MediaStream): Promise<string> {
+  const video = document.createElement('video');
+  video.srcObject = stream;
+  video.muted = true;
+  video.playsInline = true;
+  await video.play();
+
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    await new Promise<void>((resolve, reject) => {
+      video.addEventListener('loadeddata', () => resolve(), { once: true });
+      video.addEventListener('error', () => reject(new Error('Camera frame is unavailable.')), {
+        once: true,
+      });
+    });
+  }
+
+  const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(video.videoWidth * scale);
+  canvas.height = Math.round(video.videoHeight * scale);
+  const context = canvas.getContext('2d');
+  if (!context || canvas.width === 0 || canvas.height === 0) {
+    throw new Error('Camera frame is unavailable.');
+  }
+
+  context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const encoded = canvas.toDataURL('image/jpeg', 0.72).split(',')[1];
+  video.pause();
+  video.srcObject = null;
+  canvas.width = 0;
+  canvas.height = 0;
+  if (!encoded) throw new Error('Camera frame is unavailable.');
+  return encoded;
+}
+
+async function verifySecureViewer(
+  messageId: string,
+  stream: MediaStream,
+  accessToken: string
+): Promise<boolean> {
+  const imageBase64 = await captureCameraFrame(stream);
+  const response = await fetch(
+    `/api/secure/messages/${encodeURIComponent(messageId)}/verify-face`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ imageBase64 }),
+      cache: 'no-store',
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || 'Facial verification is unavailable.');
+  }
+  return data.verified === true;
+}
+
 async function deriveSecureMessageKey(secret: string, saltBase64: string): Promise<CryptoKey> {
   const material = await crypto.subtle.importKey(
     'raw',
@@ -123,6 +228,19 @@ async function deriveSecureMessageKey(secret: string, saltBase64: string): Promi
   );
 }
 
+async function getSecureMessageKey(
+  secret: string,
+  salt: string,
+  cacheId: string
+): Promise<CryptoKey> {
+  const cachedKey = await loadCachedSecureKey(cacheId);
+  if (cachedKey) return cachedKey;
+  if (!secret) throw new Error('Unlock this friendship key on this device to continue.');
+  const key = await deriveSecureMessageKey(secret, salt);
+  await saveCachedSecureKey(cacheId, key);
+  return key;
+}
+
 function secureMessageAad(userId1: string, userId2: string): ArrayBuffer {
   return toArrayBuffer(
     new TextEncoder().encode(`chatvia-secure-v1:${[userId1, userId2].sort().join(':')}`)
@@ -142,7 +260,7 @@ function ChatViewPanel({
   onLogout,
   onUserUpdate,
 }: ChatViewPanelProps) {
-  const [activeTab, setActiveTab] = useState<'chats' | 'friends' | 'profile'>('chats');
+  const [activeTab, setActiveTab] = useState<'chats' | 'friends' | 'profile' | 'key-settings'>('chats');
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
 
   // Friends & Requests
@@ -156,6 +274,7 @@ function ChatViewPanel({
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [messageAllowed, setMessageAllowed] = useState(true);
+  const [imagePreview, setImagePreview] = useState<{ src: string; alt: string } | null>(null);
 
   // Inputs
   const [inputVal, setInputVal] = useState('');
@@ -180,29 +299,85 @@ function ChatViewPanel({
   const [secureKeyStatus, setSecureKeyStatus] = useState<SecureKeyStatus | null>(null);
   const [secureKeyRefresh, setSecureKeyRefresh] = useState(0);
   const [secureKeyError, setSecureKeyError] = useState('');
+  const [secureKeyAvailable, setSecureKeyAvailable] = useState(false);
+  const [keyUpdateCurrent, setKeyUpdateCurrent] = useState('');
+  const [keyUpdateNext, setKeyUpdateNext] = useState('');
+  const [keyUpdateBusy, setKeyUpdateBusy] = useState(false);
+  const [keyUpdateError, setKeyUpdateError] = useState('');
+  const [keyUpdateMessage, setKeyUpdateMessage] = useState('');
   const [secureImage, setSecureImage] = useState<File | null>(null);
   const [secureImageUrls, setSecureImageUrls] = useState<Record<string, string>>({});
   const [revealedSecureMessages, setRevealedSecureMessages] = useState<Record<string, string>>({});
   const [secureProcessingId, setSecureProcessingId] = useState<string | null>(null);
+  const [activeSecureRevealId, setActiveSecureRevealId] = useState<string | null>(null);
+  const [secureCameraStream, setSecureCameraStream] = useState<MediaStream | null>(null);
   const secureImageInputRef = useRef<HTMLInputElement | null>(null);
+  const secureCameraStreamRef = useRef<MediaStream | null>(null);
+  const secureCameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const activeContactRef = useRef<User | null>(activeContact);
 
   // Typing
   const [otherIsTyping, setOtherIsTyping] = useState(false);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const wsAuthenticatedRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
 
+  useLayoutEffect(() => {
+    activeContactRef.current = activeContact;
+  }, [activeContact]);
+
+  const stopSecureCamera = useCallback(() => {
+    const stream = secureCameraStreamRef.current;
+    secureCameraStreamRef.current = null;
+    stream?.getTracks().forEach((track) => track.stop());
+    setSecureCameraStream(null);
+  }, []);
+
+  const clearSecureReveal = useCallback(() => {
+    setRevealedSecureMessages({});
+    setActiveSecureRevealId(null);
+    stopSecureCamera();
+  }, [stopSecureCamera]);
+
   const handleSelectContact = (contact: User) => {
+    clearSecureReveal();
     setSecurePassphrase('');
     setSecureImage(null);
     setSecureKeyStatus(null);
+    setSecureKeyAvailable(false);
     setSecureKeyError('');
+    setKeyUpdateCurrent('');
+    setKeyUpdateNext('');
+    setKeyUpdateError('');
+    setKeyUpdateMessage('');
     if (secureImageInputRef.current) secureImageInputRef.current.value = '';
+    setMessages([]);
+    setOtherIsTyping(false);
     setActiveContact(contact);
+    setMessageAllowed(true);
     setMobileChatOpen(true);
+  };
+
+  const navigateToTab = (tab: 'chats' | 'friends' | 'profile' | 'key-settings') => {
+    if (tab !== 'chats') {
+      clearSecureReveal();
+      setMobileChatOpen(false);
+      setSecurePassphrase('');
+    }
+    if (tab !== 'key-settings') {
+      setKeyUpdateCurrent('');
+      setKeyUpdateNext('');
+    }
+    setActiveTab(tab);
+  };
+
+  const handleMobileChatBack = () => {
+    clearSecureReveal();
+    setMobileChatOpen(false);
   };
 
   const toggleTheme = () => {
@@ -219,8 +394,94 @@ function ChatViewPanel({
     scrollToBottom();
   }, [messages, otherIsTyping]);
 
+  useEffect(() => {
+    const video = secureCameraVideoRef.current;
+    if (video && secureCameraStream) {
+      video.srcObject = secureCameraStream;
+      void video.play().catch((error: unknown) => {
+        console.error('Secure camera preview could not start:', error);
+        clearSecureReveal();
+      });
+    }
+    return () => {
+      if (video) video.srcObject = null;
+    };
+  }, [secureCameraStream, activeSecureRevealId, clearSecureReveal]);
+
+  useEffect(() => () => {
+    secureCameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    secureCameraStreamRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!activeSecureRevealId || !secureCameraStream) return;
+
+    let stopped = false;
+    let nextCheck: number | undefined;
+    const concealMessage = () => {
+      if (stopped) return;
+      stopped = true;
+      if (nextCheck !== undefined) window.clearTimeout(nextCheck);
+      setRevealedSecureMessages((previous) => {
+        const remaining = { ...previous };
+        delete remaining[activeSecureRevealId];
+        return remaining;
+      });
+      setActiveSecureRevealId(null);
+      if (secureCameraStreamRef.current === secureCameraStream) {
+        secureCameraStreamRef.current = null;
+        secureCameraStream.getTracks().forEach((track) => track.stop());
+        setSecureCameraStream(null);
+      }
+    };
+
+    const checkViewer = async () => {
+      if (document.visibilityState !== 'visible') {
+        concealMessage();
+        return;
+      }
+
+      try {
+        if (!(await verifySecureViewer(activeSecureRevealId, secureCameraStream, accessToken))) {
+          concealMessage();
+          return;
+        }
+      } catch (error) {
+        console.error('Secure message face check failed:', error);
+        concealMessage();
+        return;
+      }
+
+      if (!stopped) nextCheck = window.setTimeout(checkViewer, 1000);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') concealMessage();
+    };
+    const videoTrack = secureCameraStream.getVideoTracks()[0];
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    videoTrack?.addEventListener('ended', concealMessage);
+    void checkViewer();
+
+    return () => {
+      stopped = true;
+      if (nextCheck !== undefined) window.clearTimeout(nextCheck);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      videoTrack?.removeEventListener('ended', concealMessage);
+    };
+  }, [activeSecureRevealId, secureCameraStream, accessToken]);
+
+  useEffect(() => {
+    if (!imagePreview) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setImagePreview(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [imagePreview]);
+
   // Load Friends Data
-  const loadFriendsData = async () => {
+  const loadFriendsData = useCallback(async () => {
     try {
       const res = await fetch(`/api/friends?userId=${currentUser.id}`);
       if (res.ok) {
@@ -229,23 +490,25 @@ function ChatViewPanel({
         setPendingIncoming(data.pendingIncoming || []);
         setPendingOutgoing(data.pendingOutgoing || []);
 
-        if (!activeContact && data.friends && data.friends.length > 0) {
+        if (!activeContactRef.current && data.friends && data.friends.length > 0) {
           setActiveContact(data.friends[0]);
         }
       }
     } catch (err) {
       console.error('Failed to load friends:', err);
     }
-  };
+  }, [currentUser.id]);
 
   useEffect(() => {
-    loadFriendsData();
-  }, [currentUser.id]);
+    const request = window.setTimeout(() => {
+      void loadFriendsData();
+    }, 0);
+    return () => window.clearTimeout(request);
+  }, [loadFriendsData]);
 
   // Load conversation messages
   useEffect(() => {
     if (!activeContactId) {
-      setMessages([]);
       return;
     }
 
@@ -266,7 +529,6 @@ function ChatViewPanel({
     };
 
     fetchMessages();
-    setOtherIsTyping(false);
   }, [activeContactId, currentUser.id]);
 
   useEffect(() => {
@@ -282,6 +544,14 @@ function ChatViewPanel({
         if (!res.ok) throw new Error(data.error || 'Could not load shared key status.');
         setSecureKeyStatus(data);
         setSecureKeyError('');
+        if (data.ready && data.salt) {
+          const cachedKey = await loadCachedSecureKey(
+            secureKeyCacheId(currentUser.id, activeContactId, data.salt)
+          );
+          if (!controller.signal.aborted) setSecureKeyAvailable(Boolean(cachedKey));
+        } else if (!controller.signal.aborted) {
+          setSecureKeyAvailable(false);
+        }
       })
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -290,7 +560,7 @@ function ChatViewPanel({
       });
 
     return () => controller.abort();
-  }, [activeContactId, accessToken, secureKeyRefresh]);
+  }, [activeContactId, accessToken, currentUser.id, secureKeyRefresh]);
 
   useEffect(() => {
     if (!activeContactId) return;
@@ -336,67 +606,141 @@ function ChatViewPanel({
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
     const wsUrl = `${protocol}//${host}/ws`;
+    let disposed = false;
+    let retryTimer: number | undefined;
+    let retryDelay = 1000;
+    let ws: WebSocket | null = null;
 
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'authenticate', token: accessToken }));
-    };
+    const connect = () => {
+      if (disposed) return;
+      const socket = new WebSocket(wsUrl);
+      ws = socket;
+      wsRef.current = socket;
+      wsAuthenticatedRef.current = false;
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: 'authenticate', token: accessToken }));
+      };
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
 
-        if (data.type === 'new_message') {
-          const msg: Message = data.message;
-          if (
-            (msg.senderId === activeContact?.id && msg.receiverId === currentUser.id) ||
-            (msg.senderId === currentUser.id && msg.receiverId === activeContact?.id)
-          ) {
-            setMessages((prev) => [...prev, msg]);
-            if (msg.senderId === activeContact?.id) {
-              playChime();
+          if (data.type === 'presence_snapshot' && Array.isArray(data.onlineUserIds)) {
+            const onlineIds = new Set<string>(
+              data.onlineUserIds.filter((id: unknown): id is string => typeof id === 'string')
+            );
+            wsAuthenticatedRef.current = true;
+            retryDelay = 1000;
+            setFriends((previous) =>
+              previous.map((friend) => ({ ...friend, online: onlineIds.has(friend.id) }))
+            );
+            setActiveContact((previous) =>
+              previous ? { ...previous, online: onlineIds.has(previous.id) } : null
+            );
+            const contact = activeContactRef.current;
+            if (contact) {
+              fetch(
+                `/api/messages?user1=${encodeURIComponent(currentUser.id)}&user2=${encodeURIComponent(contact.id)}`
+              )
+                .then(async (response) => {
+                  const result = await response.json();
+                  if (
+                    response.ok &&
+                    result.allowed &&
+                    activeContactRef.current?.id === contact.id
+                  ) {
+                    setMessages(result.messages || []);
+                  }
+                })
+                .catch((error: unknown) =>
+                  console.error('Conversation refresh after reconnect failed:', error)
+                );
             }
-          }
+          } else if (data.type === 'new_message') {
+            const msg: Message = data.message;
+            const contactId = activeContactRef.current?.id;
+            if (
+              (msg.senderId === contactId && msg.receiverId === currentUser.id) ||
+              (msg.senderId === currentUser.id && msg.receiverId === contactId)
+            ) {
+              setMessages((previous) =>
+                previous.some((item) => item.id === msg.id) ? previous : [...previous, msg]
+              );
+              if (msg.senderId === contactId) playChime();
+            }
 
-          setFriends((prev) =>
-            prev.map((f) => {
-              if (f.id === msg.senderId || f.id === msg.receiverId) {
-                let preview = msg.content;
-                if (msg.messageType === 'image') preview = '📷 Photo';
-                else if (msg.messageType === 'file') preview = `📄 ${msg.fileName || 'File'}`;
-                return { ...f, lastMessage: preview, lastMessageTime: msg.timestamp };
-              }
-              return f;
-            })
-          );
-        } else if (data.type === 'user_status') {
-          setFriends((prev) =>
-            prev.map((f) => (f.id === data.userId ? { ...f, online: data.online } : f))
-          );
-          if (activeContact?.id === data.userId) {
-            setActiveContact((prev) => (prev ? { ...prev, online: data.online } : null));
+            setFriends((previous) =>
+              previous.map((friend) => {
+                if (friend.id === msg.senderId || friend.id === msg.receiverId) {
+                  let preview = msg.content;
+                  if (msg.isSecure || msg.messageType === 'image') preview = '📷 Photo';
+                  else if (msg.messageType === 'file') preview = `📄 ${msg.fileName || 'File'}`;
+                  return { ...friend, lastMessage: preview, lastMessageTime: msg.timestamp };
+                }
+                return friend;
+              })
+            );
+          } else if (data.type === 'secure_message_consumed') {
+            setMessages((previous) =>
+              previous.map((message) =>
+                message.id === data.messageId
+                  ? { ...message, secureConsumed: true }
+                  : message
+              )
+            );
+            setSecureImageUrls((previous) => {
+              const next = { ...previous };
+              const staleUrl = next[data.messageId];
+              if (staleUrl) URL.revokeObjectURL(staleUrl);
+              delete next[data.messageId];
+              return next;
+            });
+          } else if (data.type === 'user_status' && typeof data.online === 'boolean') {
+            setFriends((previous) =>
+              previous.map((friend) =>
+                friend.id === data.userId ? { ...friend, online: data.online } : friend
+              )
+            );
+            setActiveContact((previous) =>
+              previous && previous.id === data.userId
+                ? { ...previous, online: data.online }
+                : previous
+            );
+          } else if (data.type === 'typing_indicator') {
+            if (data.senderId === activeContactRef.current?.id) {
+              setOtherIsTyping(data.isTyping);
+            }
+          } else if (
+            data.type === 'friend_request_received' ||
+            data.type === 'friend_request_accepted'
+          ) {
+            playChime();
+            loadFriendsData();
           }
-        } else if (data.type === 'typing_indicator') {
-          if (data.senderId === activeContact?.id) {
-            setOtherIsTyping(data.isTyping);
-          }
-        } else if (data.type === 'friend_request_received') {
-          playChime();
-          loadFriendsData();
-        } else if (data.type === 'friend_request_accepted') {
-          playChime();
-          loadFriendsData();
+        } catch (err) {
+          console.error('WebSocket message error:', err);
         }
-      } catch (err) {
-        console.error('WS error:', err);
-      }
+      };
+
+      socket.onerror = () => socket.close();
+      socket.onclose = () => {
+        if (wsRef.current === socket) wsRef.current = null;
+        wsAuthenticatedRef.current = false;
+        if (disposed) return;
+        retryTimer = window.setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 30_000);
+      };
     };
 
+    connect();
     return () => {
-      ws.close();
+      disposed = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      wsAuthenticatedRef.current = false;
+      if (wsRef.current === ws) wsRef.current = null;
+      ws?.close();
     };
-  }, [currentUser.id, accessToken, activeContact?.id]);
+  }, [currentUser.id, accessToken, loadFriendsData]);
 
   // Lookup User by User ID ("do not shows the user name until they enter the user id")
   const handleLookupUserId = async (e: React.FormEvent) => {
@@ -482,7 +826,7 @@ function ChatViewPanel({
     setInputVal('');
     setShowEmojiPicker(false);
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    if (wsAuthenticatedRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
           type: 'send_message',
@@ -527,7 +871,7 @@ function ChatViewPanel({
         throw new Error(uploadData.error || 'Failed to upload file.');
       }
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      if (wsAuthenticatedRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(
           JSON.stringify({
             type: 'send_message',
@@ -614,18 +958,109 @@ function ChatViewPanel({
       );
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Could not set the shared passphrase.');
+      if (typeof data.salt !== 'string') throw new Error('The server did not return the friendship key salt.');
+      const key = await deriveSecureMessageKey(securePassphrase, data.salt);
+      await saveCachedSecureKey(
+        secureKeyCacheId(currentUser.id, activeContact.id, data.salt),
+        key
+      );
       setSecureKeyStatus({
         configured: true,
         ready: Boolean(data.ready),
         setByMe: Boolean(data.setByMe),
         confirmedByMe: Boolean(data.confirmedByMe),
-        salt: data.salt || null,
+        confirmed: Boolean(data.confirmed),
+        salt: data.salt,
       });
+      setSecureKeyAvailable(true);
+      setSecurePassphrase('');
       setSecureKeyError('');
       setUploadError(data.message || '');
     } catch (err) {
       console.error('Secure key setup error:', err);
       setUploadError(err instanceof Error ? err.message : 'Could not set shared passphrase.');
+    }
+  };
+
+  const handleUnlockSecureKey = async () => {
+    if (!activeContact || !securePassphrase) return;
+    setUploadError('');
+    try {
+      const res = await fetch(
+        `/api/friends/${encodeURIComponent(activeContact.id)}/secure-key/verify`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ secret: securePassphrase }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not unlock the shared passphrase.');
+      if (data.valid !== true || data.salt !== secureKeyStatus?.salt) {
+        throw new Error('That passphrase does not match this friendship.');
+      }
+      const key = await deriveSecureMessageKey(securePassphrase, data.salt);
+      await saveCachedSecureKey(
+        secureKeyCacheId(currentUser.id, activeContact.id, data.salt),
+        key
+      );
+      setSecureKeyAvailable(true);
+      setSecurePassphrase('');
+    } catch (err) {
+      console.error('Secure key unlock error:', err);
+      setUploadError(err instanceof Error ? err.message : 'Could not unlock the shared passphrase.');
+    }
+  };
+
+  const handleRotateSecureKey = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!activeContact || !secureKeyStatus?.ready) return;
+    setKeyUpdateBusy(true);
+    setKeyUpdateError('');
+    setKeyUpdateMessage('');
+    try {
+      const res = await fetch(
+        `/api/friends/${encodeURIComponent(activeContact.id)}/secure-key/rotate`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            currentSecret: keyUpdateCurrent,
+            newSecret: keyUpdateNext,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not update the shared passphrase.');
+      if (typeof data.salt !== 'string') throw new Error('The server did not return the new friendship key salt.');
+      const key = await deriveSecureMessageKey(keyUpdateNext, data.salt);
+      await saveCachedSecureKey(
+        secureKeyCacheId(currentUser.id, activeContact.id, data.salt),
+        key
+      );
+      setSecureKeyStatus({
+        configured: true,
+        ready: false,
+        setByMe: true,
+        confirmedByMe: false,
+        confirmed: false,
+        salt: data.salt,
+      });
+      setSecureKeyAvailable(true);
+      setKeyUpdateCurrent('');
+      setKeyUpdateNext('');
+      setKeyUpdateMessage(data.message || 'The new passphrase is saved. Your friend must confirm it.');
+    } catch (err) {
+      console.error('Secure key update error:', err);
+      setKeyUpdateError(err instanceof Error ? err.message : 'Could not update the shared passphrase.');
+    } finally {
+      setKeyUpdateBusy(false);
     }
   };
 
@@ -636,17 +1071,20 @@ function ChatViewPanel({
       !secureKeyStatus?.ready ||
       !secureKeyStatus.salt ||
       !secureImage ||
-      !inputVal.trim() ||
-      !securePassphrase
+      !inputVal.trim()
     ) {
-      setUploadError('A confirmed shared passphrase, PNG image, and text are required.');
+      setUploadError('A confirmed shared key, PNG image, and text are required.');
       return;
     }
 
     setUploading(true);
     setUploadError('');
     try {
-      const key = await deriveSecureMessageKey(securePassphrase, secureKeyStatus.salt);
+      const key = await getSecureMessageKey(
+        '',
+        secureKeyStatus.salt,
+        secureKeyCacheId(currentUser.id, activeContact.id, secureKeyStatus.salt)
+      );
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const encryptedText = new Uint8Array(
         await crypto.subtle.encrypt(
@@ -674,6 +1112,7 @@ function ChatViewPanel({
         },
         body: JSON.stringify({
           friendId: activeContact.id,
+          keySalt: secureKeyStatus.salt,
           imageBase64,
           payloadBase64: bytesToBase64(payload),
         }),
@@ -701,16 +1140,32 @@ function ChatViewPanel({
   };
 
   const handleDecryptSecureMessage = async (message: Message) => {
-    if (!activeContact || !secureKeyStatus?.salt || !securePassphrase) {
-      setUploadError('Enter your confirmed shared passphrase first.');
+    if (!activeContact || !secureKeyStatus?.salt) {
+      setUploadError('Set up the shared passphrase for this friendship first.');
       return;
     }
 
     setSecureProcessingId(message.id);
     setUploadError('');
+    let stream: MediaStream | null = null;
+    let revealStarted = false;
     let combined: Uint8Array | undefined;
     let plaintext: Uint8Array | undefined;
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera access is required to reveal secure messages.');
+      }
+      const captureStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      stream = captureStream;
+      secureCameraStreamRef.current = captureStream;
+      setSecureCameraStream(captureStream);
+      if (!(await verifySecureViewer(message.id, captureStream, accessToken))) {
+        throw new Error('Face check failed. The message remains unopened.');
+      }
+
       const payloadRes = await fetch(
         `/api/secure/messages/${encodeURIComponent(message.id)}/payload`,
         { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` } }
@@ -722,7 +1177,11 @@ function ChatViewPanel({
       if (combined.length < 28) throw new Error('The encrypted message is incomplete.');
       const iv = combined.slice(0, 12);
       const encryptedText = combined.slice(12);
-      const key = await deriveSecureMessageKey(securePassphrase, secureKeyStatus.salt);
+      const key = await getSecureMessageKey(
+        '',
+        secureKeyStatus.salt,
+        secureKeyCacheId(currentUser.id, activeContact.id, secureKeyStatus.salt)
+      );
       plaintext = new Uint8Array(
         await crypto.subtle.decrypt(
           {
@@ -736,6 +1195,10 @@ function ChatViewPanel({
       );
       const text = new TextDecoder('utf-8', { fatal: true }).decode(plaintext);
 
+      if (!(await verifySecureViewer(message.id, captureStream, accessToken))) {
+        throw new Error('Face check failed. The message remains unopened.');
+      }
+
       const consumeRes = await fetch(
         `/api/secure/messages/${encodeURIComponent(message.id)}/consume`,
         {
@@ -746,12 +1209,23 @@ function ChatViewPanel({
       const consumeData = await consumeRes.json();
       if (!consumeRes.ok) throw new Error(consumeData.error || 'This message was already viewed.');
 
+      const liveVideoTrack = captureStream.getVideoTracks()[0];
+      if (
+        activeContactRef.current?.id !== activeContact.id ||
+        document.visibilityState !== 'visible' ||
+        liveVideoTrack?.readyState !== 'live'
+      ) {
+        throw new Error('The face check ended before the text could be revealed.');
+      }
+
       setRevealedSecureMessages((previous) => ({ ...previous, [message.id]: text }));
       setMessages((previous) =>
         previous.map((item) =>
           item.id === message.id ? { ...item, secureConsumed: true } : item
         )
       );
+      setActiveSecureRevealId(message.id);
+      revealStarted = true;
     } catch (err) {
       console.error('Secure message decryption error:', err);
       const wrongPassphrase =
@@ -766,6 +1240,13 @@ function ChatViewPanel({
     } finally {
       combined?.fill(0);
       plaintext?.fill(0);
+      if (!revealStarted && stream) {
+        stream.getTracks().forEach((track) => track.stop());
+        if (secureCameraStreamRef.current === stream) {
+          secureCameraStreamRef.current = null;
+          setSecureCameraStream(null);
+        }
+      }
       setSecureProcessingId(null);
     }
   };
@@ -779,7 +1260,7 @@ function ChatViewPanel({
     setInputVal(e.target.value);
     if (!activeContact || !messageAllowed) return;
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    if (wsAuthenticatedRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
           type: 'typing',
@@ -791,7 +1272,11 @@ function ChatViewPanel({
 
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = setTimeout(() => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && activeContact) {
+      if (
+        wsAuthenticatedRef.current &&
+        wsRef.current?.readyState === WebSocket.OPEN &&
+        activeContact
+      ) {
         wsRef.current.send(
           JSON.stringify({
             type: 'typing',
@@ -840,11 +1325,11 @@ function ChatViewPanel({
   );
 
   return (
-    <div className={`chatvia-app${mobileChatOpen ? ' mobile-chat-open' : ''}`}>
+    <div className={`cryptchat-app${mobileChatOpen ? ' mobile-chat-open' : ''}`}>
       {/* 1. Leftmost Navigation Rail */}
       <aside className="nav-rail">
         <div className="rail-top">
-          <div className="rail-brand-logo" title="Chatvia Messenger">
+          <div className="rail-brand-logo" title="CryptChat">
             💬
           </div>
 
@@ -852,7 +1337,7 @@ function ChatViewPanel({
             <button
               type="button"
               className={`rail-nav-btn ${activeTab === 'chats' ? 'active' : ''}`}
-              onClick={() => setActiveTab('chats')}
+              onClick={() => navigateToTab('chats')}
               title="Chats"
             >
               💭
@@ -861,7 +1346,7 @@ function ChatViewPanel({
             <button
               type="button"
               className={`rail-nav-btn ${activeTab === 'friends' ? 'active' : ''}`}
-              onClick={() => setActiveTab('friends')}
+              onClick={() => navigateToTab('friends')}
               title="Find Users by ID & Friend Requests"
             >
               👥
@@ -873,12 +1358,20 @@ function ChatViewPanel({
             <button
               type="button"
               className={`rail-nav-btn ${activeTab === 'profile' ? 'active' : ''}`}
-              onClick={() => setActiveTab('profile')}
+              onClick={() => navigateToTab('profile')}
               title="My Profile"
             >
               👤
             </button>
 
+            <button
+              type="button"
+              className={`rail-nav-btn ${activeTab === 'key-settings' ? 'active' : ''}`}
+              onClick={() => navigateToTab('key-settings')}
+              title="Friendship key updates"
+            >
+              🔑
+            </button>
           </div>
         </div>
 
@@ -895,7 +1388,7 @@ function ChatViewPanel({
           <div
             className="rail-user-avatar"
             title={`Logged in as ${currentUser.fullName} (${currentUser.userIdCode})`}
-            onClick={() => setActiveTab('profile')}
+            onClick={() => navigateToTab('profile')}
           >
             <img src={currentUser.avatar} alt={currentUser.fullName} />
             <span className="rail-user-status" />
@@ -909,23 +1402,30 @@ function ChatViewPanel({
           <button
             type="button"
             className={activeTab === 'chats' ? 'active' : ''}
-            onClick={() => setActiveTab('chats')}
+            onClick={() => navigateToTab('chats')}
           >
             Chats
           </button>
           <button
             type="button"
             className={activeTab === 'friends' ? 'active' : ''}
-            onClick={() => setActiveTab('friends')}
+            onClick={() => navigateToTab('friends')}
           >
             Friends{pendingIncoming.length > 0 ? ` (${pendingIncoming.length})` : ''}
           </button>
           <button
             type="button"
             className={activeTab === 'profile' ? 'active' : ''}
-            onClick={() => setActiveTab('profile')}
+            onClick={() => navigateToTab('profile')}
           >
             Profile
+          </button>
+          <button
+            type="button"
+            className={activeTab === 'key-settings' ? 'active' : ''}
+            onClick={() => navigateToTab('key-settings')}
+          >
+            Keys
           </button>
           <button type="button" onClick={toggleTheme} aria-label="Toggle theme">
             {theme === 'light' ? '🌙' : '☀️'}
@@ -940,7 +1440,7 @@ function ChatViewPanel({
                   type="button"
                   className="panel-add-btn"
                   title="Add Friend by ID"
-                  onClick={() => setActiveTab('friends')}
+                  onClick={() => navigateToTab('friends')}
                 >
                   +
                 </button>
@@ -1045,14 +1545,8 @@ function ChatViewPanel({
 
             {idActionMsg && (
               <div
-                style={{
-                  padding: '10px 14px',
-                  borderRadius: 8,
-                  fontSize: 13,
-                  backgroundColor: idActionMsg.isError ? 'rgba(239, 71, 111, 0.12)' : 'rgba(6, 214, 160, 0.12)',
-                  color: idActionMsg.isError ? 'var(--badge-danger)' : 'var(--badge-online)',
-                  border: `1px solid ${idActionMsg.isError ? 'rgba(239, 71, 111, 0.25)' : 'rgba(6, 214, 160, 0.25)'}`,
-                }}
+                role={idActionMsg.isError ? 'alert' : 'status'}
+                className={`status-notice ${idActionMsg.isError ? 'status-notice--error' : 'status-notice--success'}`}
               >
                 {idActionMsg.text}
               </div>
@@ -1111,7 +1605,7 @@ function ChatViewPanel({
                           if (friendObj) {
                             handleSelectContact(friendObj);
                             setMessageAllowed(true);
-                            setActiveTab('chats');
+                            navigateToTab('chats');
                           }
                         }}
                       >
@@ -1214,7 +1708,7 @@ function ChatViewPanel({
 
               <div>
                 <h3 className="profile-name-text">{currentUser.fullName}</h3>
-                <p className="profile-bio-text">{currentUser.bio || 'Hey there! I am using Chatvia.'}</p>
+                <p className="profile-bio-text">{currentUser.bio || 'Hey there! I am using CryptChat.'}</p>
               </div>
 
               {/* User ID Chip with Copy */}
@@ -1298,18 +1792,146 @@ function ChatViewPanel({
             )}
           </div>
         )}
+        {activeTab === 'key-settings' && (
+          <div className="profile-panel-container">
+            <h2 className="panel-heading">Friendship key updates</h2>
+            <p className="mb-4 text-sm text-[var(--text-secondary)]">
+              A shared key is saved once for each friendship. Update it here; your friend must confirm a new key once before private messages are enabled again.
+            </p>
+            <div className="mb-5 flex flex-wrap gap-2">
+              {friends.length === 0 ? (
+                <p className="text-sm text-[var(--text-secondary)]">Add a friend before setting up a shared key.</p>
+              ) : friends.map((friend) => (
+                <button
+                  type="button"
+                  key={friend.id}
+                  className={`rounded-xl border px-3 py-2 text-sm font-medium ${
+                    activeContact?.id === friend.id
+                      ? 'border-emerald-600 bg-emerald-700 text-white'
+                      : 'border-[var(--border-color)] bg-[var(--bg-card)] text-[var(--text-primary)]'
+                  }`}
+                  onClick={() => {
+                    if (activeContact?.id !== friend.id) handleSelectContact(friend);
+                    setKeyUpdateError('');
+                    setKeyUpdateMessage('');
+                  }}
+                >
+                  {friend.fullName}
+                </button>
+              ))}
+            </div>
+            {activeContact ? (
+              <section className="max-w-2xl rounded-2xl border border-[var(--border-color)] bg-[var(--bg-card)] p-4 shadow-sm sm:p-6">
+                <h3 className="mb-2 text-base font-semibold text-[var(--text-primary)]">
+                  {activeContact.fullName}
+                </h3>
+                {!secureKeyStatus ? (
+                  <p className="text-sm text-[var(--text-secondary)]">Loading this friendship’s key status…</p>
+                ) : !secureKeyStatus.configured ? (
+                  <p className="text-sm text-[var(--text-secondary)]">
+                    Set up the first shared key in this friend’s chat. You will not need to enter it for each message.
+                  </p>
+                ) : !secureKeyStatus.ready && secureKeyStatus.setByMe ? (
+                  <p className="text-sm text-amber-700 dark:text-amber-300">
+                    Waiting for your friend to confirm the new shared key. Private messages are paused until they do.
+                  </p>
+                ) : !secureKeyStatus.ready ? (
+                  <form
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void handleSetSecureKey();
+                    }}
+                    className="flex flex-col gap-3"
+                  >
+                    <p className="text-sm text-[var(--text-secondary)]">
+                      Your friend set a shared key. Enter it once to confirm and save it on this device.
+                    </p>
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      minLength={12}
+                      maxLength={256}
+                      aria-label="Confirm shared passphrase"
+                      placeholder="Shared passphrase"
+                      value={securePassphrase}
+                      onChange={(event) => setSecurePassphrase(event.target.value)}
+                      className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-input)] px-4 py-3 text-sm text-[var(--text-primary)]"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!securePassphrase.trim()}
+                      className="w-fit rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+                    >
+                      Confirm shared key
+                    </button>
+                    {uploadError && <p role="alert" className="text-sm text-red-600">{uploadError}</p>}
+                  </form>
+                ) : (
+                  <form onSubmit={handleRotateSecureKey} className="flex flex-col gap-3">
+                    <p className="text-sm text-[var(--text-secondary)]">
+                      Changing the key pauses private messages until your friend confirms the new one. Pending private images must be viewed before changing the key.
+                    </p>
+                    {keyUpdateError && <p role="alert" className="status-notice status-notice--error">{keyUpdateError}</p>}
+                    {keyUpdateMessage && <p role="status" className="status-notice status-notice--success">{keyUpdateMessage}</p>}
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      minLength={12}
+                      maxLength={256}
+                      aria-label="Current shared passphrase"
+                      placeholder="Current shared passphrase"
+                      value={keyUpdateCurrent}
+                      onChange={(event) => setKeyUpdateCurrent(event.target.value)}
+                      required
+                      className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-input)] px-4 py-3 text-sm text-[var(--text-primary)]"
+                    />
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      minLength={12}
+                      maxLength={256}
+                      aria-label="New shared passphrase"
+                      placeholder="New shared passphrase (12+ characters)"
+                      value={keyUpdateNext}
+                      onChange={(event) => setKeyUpdateNext(event.target.value)}
+                      required
+                      className="rounded-xl border border-[var(--border-color)] bg-[var(--bg-input)] px-4 py-3 text-sm text-[var(--text-primary)]"
+                    />
+                    <button
+                      type="submit"
+                      disabled={keyUpdateBusy || !keyUpdateCurrent || keyUpdateNext.trim().length < 12}
+                      className="w-fit rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+                    >
+                      {keyUpdateBusy ? 'Updating…' : 'Update friendship key'}
+                    </button>
+                  </form>
+                )}
+              </section>
+            ) : (
+              <p className="text-sm text-[var(--text-secondary)]">Choose a friend to manage their shared key.</p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 3. Main Chat View Area */}
       <div className="chat-main-area">
-        {activeContact ? (
+        {activeTab === 'key-settings' ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
+            <div className="text-5xl" aria-hidden="true">🔐</div>
+            <h2 className="text-xl font-bold text-[var(--text-primary)]">Keys are scoped per friendship</h2>
+            <p className="max-w-md text-sm text-[var(--text-secondary)]">
+              Select a friend in the key updates panel to confirm or rotate that connection’s shared key.
+            </p>
+          </div>
+        ) : activeContact ? (
           <>
             {/* Header */}
             <div className="chat-header-bar">
               <button
                 type="button"
                 className="mobile-chat-back"
-                onClick={() => setMobileChatOpen(false)}
+                onClick={handleMobileChatBack}
                 aria-label="Back to chats"
               >
                 ←
@@ -1336,8 +1958,7 @@ function ChatViewPanel({
                   className="header-icon-btn"
                   title="Profile Details"
                   onClick={() => {
-                    setActiveTab('profile');
-                    setMobileChatOpen(false);
+                    navigateToTab('profile');
                   }}
                 >
                   ℹ️
@@ -1372,39 +1993,80 @@ function ChatViewPanel({
                           {m.isSecure ? (
                             <div className="msg-image-bubble">
                               {secureImageUrls[m.id] ? (
-                                <img
-                                  src={secureImageUrls[m.id]}
-                                  alt="Steganographic PNG message"
-                                />
+                                <button
+                                  type="button"
+                                  className="image-preview-trigger"
+                                  aria-label="Enlarge secure image"
+                                  onClick={() =>
+                                    setImagePreview({
+                                      src: secureImageUrls[m.id],
+                                      alt: 'Secure image message',
+                                    })
+                                  }
+                                >
+                                  <img src={secureImageUrls[m.id]} alt="Secure image message" />
+                                </button>
                               ) : (
-                                <span>Loading secure image…</span>
+                                <span className="image-loading-state">Loading image…</span>
                               )}
                               {revealedSecureMessages[m.id] ? (
                                 <div className="secure-message-revealed">
-                                  <strong>Decrypted text</strong>
+                                  {activeSecureRevealId === m.id && secureCameraStream && (
+                                    <div className="secure-camera-guard">
+                                      <video
+                                        ref={secureCameraVideoRef}
+                                        autoPlay
+                                        muted
+                                        playsInline
+                                        aria-label="Live face verification preview"
+                                      />
+                                      <span>Face check active</span>
+                                      <button
+                                        type="button"
+                                        aria-label="Hide private text"
+                                        onClick={clearSecureReveal}
+                                      >
+                                        ×
+                                      </button>
+                                    </div>
+                                  )}
                                   <p>{revealedSecureMessages[m.id]}</p>
-                                  <small>Viewed once; the original PNG has been restored.</small>
                                 </div>
-                              ) : m.secureConsumed ? (
-                                <small>Viewed once; the original PNG has been restored.</small>
-                              ) : m.receiverId === currentUser.id ? (
+                              ) : m.secureConsumed ? null : m.receiverId === currentUser.id ? (
                                 <button
                                   type="button"
-                                  className="friend-send-btn"
+                                  className="secure-decrypt-btn"
+                                  aria-label="Decrypt secure message once"
+                                  title={secureProcessingId === m.id ? 'Checking face and decrypting' : 'Decrypt once'}
                                   disabled={secureProcessingId === m.id || !secureKeyStatus?.ready}
                                   onClick={() => handleDecryptSecureMessage(m)}
                                 >
-                                  {secureProcessingId === m.id ? 'Decrypting…' : 'Decrypt once'}
+                                  {secureProcessingId === m.id ? (
+                                    <span className="secure-decrypt-spinner" aria-hidden="true" />
+                                  ) : (
+                                    <span aria-hidden="true">⌄</span>
+                                  )}
                                 </button>
-                              ) : (
-                                <small>Only the recipient can decrypt this message once.</small>
-                              )}
+                              ) : null}
                             </div>
                           ) : m.messageType === 'image' && m.fileUrl ? (
                             <div className="msg-image-bubble">
-                              <a href={`${m.fileUrl}?userId=${encodeURIComponent(currentUser.id)}`} target="_blank" rel="noopener noreferrer">
-                              <img src={`${m.fileUrl}?userId=${encodeURIComponent(currentUser.id)}`} alt={m.fileName || 'Attached Photo'} />
-                              </a>
+                              <button
+                                type="button"
+                                className="image-preview-trigger"
+                                aria-label={`Enlarge image: ${m.fileName || 'attached photo'}`}
+                                onClick={() =>
+                                  setImagePreview({
+                                    src: `${m.fileUrl}?userId=${encodeURIComponent(currentUser.id)}`,
+                                    alt: m.fileName || 'Attached photo',
+                                  })
+                                }
+                              >
+                                <img
+                                  src={`${m.fileUrl}?userId=${encodeURIComponent(currentUser.id)}`}
+                                  alt={m.fileName || 'Attached photo'}
+                                />
+                              </button>
                             </div>
                           ) : m.messageType === 'file' && m.fileUrl ? (
                             /* File Attachment Message */
@@ -1536,8 +2198,8 @@ function ChatViewPanel({
                   type="button"
                   className={`inline-flex w-full items-center justify-between rounded-xl border px-4 py-3 text-left text-sm font-semibold shadow-sm transition sm:w-auto ${
                     secureMode
-                      ? 'border-indigo-500 bg-indigo-600 text-white hover:bg-indigo-700'
-                      : 'border-[var(--border-color)] bg-[var(--bg-card)] text-[var(--text-primary)] hover:border-indigo-400'
+                      ? 'border-emerald-700 bg-emerald-700 text-white hover:bg-emerald-800'
+                      : 'border-[var(--border-color)] bg-[var(--bg-card)] text-[var(--text-primary)] hover:border-emerald-500'
                   }`}
                   aria-pressed={secureMode}
                   onClick={() => {
@@ -1555,15 +2217,15 @@ function ChatViewPanel({
                   </span>
                 </button>
                 {secureMode && (
-                  <section className="w-full rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-violet-50 p-4 text-slate-800 shadow-sm dark:border-indigo-400/30 dark:from-slate-800 dark:to-slate-900 dark:text-slate-100 sm:p-5">
+                  <section className="secure-key-card w-full rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 to-teal-50 p-4 text-slate-800 shadow-sm dark:border-emerald-400/30 dark:from-slate-800 dark:to-slate-900 dark:text-slate-100 sm:p-5">
                     <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <div className="flex items-center gap-2">
-                          <span className="grid h-9 w-9 place-items-center rounded-xl bg-indigo-100 text-lg dark:bg-indigo-400/15">🔐</span>
+                          <span className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-100 text-lg dark:bg-emerald-400/15">🔐</span>
                           <h3 className="text-sm font-bold sm:text-base">Shared passphrase</h3>
                         </div>
                         <p className="mt-2 max-w-xl text-xs leading-relaxed text-slate-600 dark:text-slate-300 sm:text-sm">
-                          Set a passphrase now. Your friend can confirm it later by entering the same one. The passphrase stays in this browser.
+                          Create one key for this friendship. Enter it once to set or confirm it; this device then keeps a non-exportable encryption key so you do not have to type it for each message. The server stores only a salted verifier.
                         </p>
                       </div>
                       <span className={`rounded-full px-3 py-1 text-xs font-semibold ${
@@ -1576,7 +2238,7 @@ function ChatViewPanel({
                         {!secureKeyStatus
                           ? 'Checking…'
                           : secureKeyStatus.ready
-                            ? 'Ready for you'
+                            ? secureKeyAvailable ? 'Ready on this device' : 'Unlock this device once'
                             : secureKeyStatus.configured
                               ? secureKeyStatus.setByMe ? 'Waiting for friend' : 'Confirmation needed'
                               : 'Not set up'}
@@ -1584,59 +2246,88 @@ function ChatViewPanel({
                     </div>
 
                     {secureKeyError && (
-                      <p role="alert" className="mb-3 rounded-lg bg-rose-100 px-3 py-2 text-xs text-rose-700 dark:bg-rose-400/10 dark:text-rose-200">
+                      <p role="alert" className="status-notice status-notice--error mb-3">
                         {secureKeyError}
                       </p>
                     )}
-                    {secureKeyStatus?.configured && (
+                    {secureKeyStatus && (
                       <p className="mb-3 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-                        {secureKeyStatus.ready
-                          ? 'Your passphrase is ready for sending and decrypting messages.'
-                          : secureKeyStatus.setByMe
-                            ? 'You can send with this passphrase now. Your friend can confirm it whenever they are ready.'
-                            : 'Your friend has already set a passphrase. Enter the matching passphrase to confirm.'}
+                        {!secureKeyStatus.configured
+                          ? 'Set one shared passphrase for this friendship. Your friend confirms it once.'
+                          : secureKeyStatus.confirmed
+                            ? secureKeyAvailable
+                              ? 'The key is saved on this device and will be reused automatically for private messages.'
+                              : 'Enter the shared passphrase once to unlock it on this device.'
+                            : secureKeyStatus.setByMe
+                              ? 'Your key is saved. Your friend must confirm it once before private messages are enabled.'
+                              : 'Your friend has set the shared key. Enter it once to confirm and save it on this device.'}
                       </p>
                     )}
 
-                    <div className="flex flex-col gap-2 sm:flex-row">
-                      <input
-                        type="password"
-                        autoComplete="current-password"
-                        minLength={12}
-                        maxLength={256}
-                        aria-label="Shared passphrase"
-                        placeholder="Enter shared passphrase (12+ characters)"
-                        value={securePassphrase}
-                        onChange={(event) => setSecurePassphrase(event.target.value)}
-                        className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 dark:border-slate-600 dark:bg-slate-800 dark:text-white dark:focus:ring-indigo-500/20"
-                      />
+                    {secureKeyStatus?.configured && secureKeyStatus.ready && (
+                      <p className="mb-3 text-xs text-emerald-700 dark:text-emerald-300">
+                        {secureKeyAvailable ? 'Saved securely on this device.' : 'This device needs to be unlocked once.'}
+                      </p>
+                    )}
+                    {secureKeyStatus?.configured && secureKeyStatus.ready && (
                       <button
                         type="button"
-                        className="inline-flex min-h-11 items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
-                        disabled={
-                          !secureKeyStatus ||
-                          secureKeyStatus.ready ||
-                          (secureKeyStatus.setByMe && !secureKeyStatus.confirmedByMe) ||
-                          !securePassphrase.trim()
-                        }
-                        onClick={handleSetSecureKey}
+                        className="mb-3 text-left text-xs font-semibold text-emerald-800 underline dark:text-emerald-300"
+                        onClick={() => navigateToTab('key-settings')}
                       >
-                        {!secureKeyStatus
-                          ? 'Checking…'
-                          : secureKeyStatus.ready
-                            ? 'Shared key ready'
-                            : !secureKeyStatus.configured
-                              ? 'Set passphrase'
-                              : secureKeyStatus.setByMe
-                                ? 'Passphrase set'
-                                : 'Confirm passphrase'}
+                        Manage or update this friendship key
                       </button>
-                    </div>
-                    <div className="mt-4 flex flex-col gap-2 border-t border-indigo-200/70 pt-4 dark:border-slate-700 sm:flex-row sm:items-center">
+                    )}
+
+                    {secureKeyStatus && (
+                      (!secureKeyStatus.configured ||
+                        (!secureKeyStatus.ready && !secureKeyStatus.setByMe) ||
+                        (secureKeyStatus.ready && !secureKeyAvailable)) && (
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            minLength={12}
+                            maxLength={256}
+                            aria-label="Shared passphrase"
+                            placeholder={
+                              !secureKeyStatus.configured
+                                ? 'Create shared passphrase (12+ characters)'
+                                : secureKeyStatus.ready
+                                  ? 'Unlock shared passphrase on this device'
+                                  : 'Enter shared passphrase to confirm once'
+                            }
+                            value={securePassphrase}
+                            onChange={(event) => setSecurePassphrase(event.target.value)}
+                            className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-100 dark:border-slate-600 dark:bg-slate-800 dark:text-white dark:focus:ring-emerald-500/20"
+                          />
+                          <button
+                            type="button"
+                            className="inline-flex min-h-11 items-center justify-center rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={
+                              !securePassphrase.trim() ||
+                              (secureKeyStatus.ready && securePassphrase.length < 12)
+                            }
+                            onClick={
+                              secureKeyStatus.ready
+                                ? handleUnlockSecureKey
+                                : handleSetSecureKey
+                            }
+                          >
+                            {!secureKeyStatus.configured
+                              ? 'Set key once'
+                              : secureKeyStatus.ready
+                                ? 'Unlock once'
+                                : 'Confirm key once'}
+                          </button>
+                        </div>
+                      )
+                    )}
+                    <div className="mt-4 flex flex-col gap-2 border-t border-emerald-200/70 pt-4 dark:border-slate-700 sm:flex-row sm:items-center">
                       <button
                         type="button"
-                        className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl border border-indigo-200 bg-white px-4 py-2.5 text-sm font-semibold text-indigo-700 transition hover:border-indigo-400 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-indigo-200 dark:hover:bg-slate-700"
-                        disabled={uploading || !secureKeyStatus?.ready}
+                        className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-white px-4 py-2.5 text-sm font-semibold text-emerald-800 transition hover:border-emerald-400 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:text-emerald-200 dark:hover:bg-slate-700"
+                        disabled={uploading || !secureKeyStatus?.ready || !secureKeyAvailable}
                         onClick={() => {
                           if (secureImageInputRef.current) {
                             secureImageInputRef.current.value = '';
@@ -1652,7 +2343,7 @@ function ChatViewPanel({
                           ? `${secureImage.name} · ${(secureImage.size / 1024).toFixed(0)} KB`
                           : secureKeyStatus?.ready
                             ? 'PNG up to 8 MB · text is encrypted before sending'
-                            : 'Confirm the shared passphrase to choose an image'}
+                            : 'Set or unlock the shared key to choose an image'}
                       </p>
                     </div>
                   </section>
@@ -1707,7 +2398,7 @@ function ChatViewPanel({
                     !inputVal.trim() ||
                     uploading ||
                     (secureMode &&
-                      (!secureImage || !securePassphrase || !secureKeyStatus?.ready))
+                      (!secureImage || !secureKeyStatus?.ready || !secureKeyAvailable))
                   }
                   title="Send Message"
                 >
@@ -1719,13 +2410,37 @@ function ChatViewPanel({
         ) : (
           <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-secondary)' }}>
             <div style={{ fontSize: 48, marginBottom: 12 }}>💬</div>
-            <h3 style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-primary)' }}>Welcome to Chatvia</h3>
+            <h3 style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-primary)' }}>Welcome to CryptChat</h3>
             <p style={{ fontSize: 14, color: 'var(--text-secondary)', marginTop: 6, maxWidth: 320 }}>
               Select a friend from the left sidebar or click <strong>👥 Friends</strong> to connect using a User ID!
             </p>
           </div>
         )}
       </div>
+      {imagePreview && (
+        <div
+          className="image-preview-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Image preview"
+          onClick={() => setImagePreview(null)}
+        >
+          <button
+            type="button"
+            className="image-preview-close"
+            aria-label="Close image preview"
+            onClick={() => setImagePreview(null)}
+          >
+            ×
+          </button>
+          <img
+            src={imagePreview.src}
+            alt={imagePreview.alt}
+            className="image-preview-full"
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -1862,12 +2577,12 @@ export default function App() {
           <div className="auth-card-header">
             <div className="auth-brand-badge">💬</div>
             <h1 className="auth-title">
-              {isLogin ? 'Sign in to Chatvia' : 'Create Chatvia Account'}
+              {isLogin ? 'Sign in to CryptChat' : 'Create CryptChat Account'}
             </h1>
             <p className="auth-subtitle">
               {isLogin
                 ? 'Sign in with your Username, Gmail ID, and Password'
-                : 'Join Chatvia to connect with friends via User ID'}
+                : 'Join CryptChat to connect with friends via User ID'}
             </p>
           </div>
 
@@ -1900,7 +2615,7 @@ export default function App() {
             </button>
           </div>
 
-          {errorMsg && <div className="auth-error-alert">⚠️ {errorMsg}</div>}
+          {errorMsg && <div className="auth-error-alert" role="alert">{errorMsg}</div>}
 
           <form onSubmit={handleAuthSubmit} className="auth-form-body">
             {!isLogin && (
@@ -1956,8 +2671,8 @@ export default function App() {
             {!isLogin && (
               <div className="auth-input-group">
                 <label className="auth-input-label">Required face enrollment</label>
-                <p className="auth-subtitle">
-                  Capture one clearly visible face. We create an InspireFace recognition template and store it encrypted in the database; the camera image is not retained. This is not a liveness check.
+                <p className="auth-subtitle status-notice status-notice--info">
+                  Capture one clearly visible face. We store an encrypted InspireFace template, not this image. When you open a private message, CryptChat sends temporary camera frames to the configured face service to verify your face while the text is visible; frames are not stored. This is not a liveness check and cannot detect people outside the camera view or prevent recording.
                 </p>
                 {cameraStream && !faceImage && (
                   <video
@@ -2008,7 +2723,7 @@ export default function App() {
                     onChange={(event) => setFaceConsent(event.target.checked)}
                     required
                   />
-                  I consent to creating and storing an encrypted facial recognition template for this account.
+                  I consent to storing an encrypted face template and using temporary camera frames to verify me while viewing private messages.
                 </label>
               </div>
             )}

@@ -37,7 +37,7 @@ export async function initDatabase() {
         full_name VARCHAR(128) NOT NULL,
         password_hash VARCHAR(128) NOT NULL,
         avatar TEXT,
-        bio TEXT DEFAULT 'Hey there! I am using Chatvia.',
+        bio TEXT DEFAULT 'Hey there! I am using CryptChat.',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -82,6 +82,10 @@ export async function initDatabase() {
       );
 
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_secure BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE users ALTER COLUMN bio SET DEFAULT 'Hey there! I am using CryptChat.';
+      UPDATE users
+      SET bio = 'Hey there! I am using CryptChat.'
+      WHERE bio = 'Hey there! I am using Chatvia.';
 
       CREATE TABLE IF NOT EXISTS attachments (
         id VARCHAR(64) PRIMARY KEY,

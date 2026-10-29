@@ -20,6 +20,11 @@ class FaceEnrollmentRequest(BaseModel):
     image_base64: str
 
 
+class FaceVerificationRequest(BaseModel):
+    image_base64: str
+    reference_embedding_base64: str
+
+
 class SteganographyRequest(BaseModel):
     image_base64: str
     payload_base64: str | None = None
@@ -94,6 +99,68 @@ def create_face_embedding(request: FaceEnrollmentRequest) -> dict[str, str]:
 
     template = np.asarray(embedding, dtype="<f4")
     return {"embedding": base64.b64encode(template.tobytes()).decode("ascii")}
+
+
+@app.post("/face/verify")
+def verify_face(request: FaceVerificationRequest) -> dict[str, bool]:
+    if len(request.image_base64) > 2_800_000:
+        raise HTTPException(status_code=413, detail="The face image is too large.")
+
+    try:
+        image_bytes = base64.b64decode(request.image_base64, validate=True)
+        reference_bytes = base64.b64decode(
+            request.reference_embedding_base64, validate=True
+        )
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="The face capture is invalid.") from None
+
+    if not image_bytes or len(image_bytes) > 2_000_000:
+        raise HTTPException(status_code=413, detail="The face image is invalid or too large.")
+    if (
+        not reference_bytes
+        or len(reference_bytes) > 16_384
+        or len(reference_bytes) % np.dtype("<f4").itemsize != 0
+    ):
+        raise HTTPException(status_code=400, detail="The reference face template is invalid.")
+
+    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="The captured image could not be read.")
+
+    height, width = image.shape[:2]
+    if width < 100 or height < 100 or width * height > 6_000_000:
+        raise HTTPException(status_code=400, detail="The captured image dimensions are invalid.")
+
+    try:
+        session = _get_session()
+        with _session_lock:
+            faces = session.face_detection(image)
+            if len(faces) != 1:
+                return {"verified": False}
+            embedding = session.face_feature_extract(image, faces[0])
+
+        if embedding is None or embedding.size == 0:
+            return {"verified": False}
+
+        reference = np.frombuffer(reference_bytes, dtype="<f4")
+        observed = np.asarray(embedding, dtype="<f4").reshape(-1)
+        if (
+            reference.size != observed.size
+            or not np.isfinite(reference).all()
+            or not np.isfinite(observed).all()
+        ):
+            return {"verified": False}
+
+        similarity = isf.feature_comparison(reference, observed)
+        return {"verified": similarity >= isf.get_recommended_cosine_threshold()}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("InspireFace verification failed.")
+        raise HTTPException(
+            status_code=503,
+            detail="Facial verification is temporarily unavailable.",
+        ) from None
 
 
 @app.post("/stego/embed")

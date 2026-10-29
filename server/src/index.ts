@@ -190,6 +190,64 @@ async function extractFaceEmbedding(imageBase64: string): Promise<Buffer> {
   return embedding;
 }
 
+function decryptFaceTemplate(
+  ciphertext: Buffer,
+  nonce: Buffer,
+  authTag: Buffer
+): Buffer {
+  const encryptionKey = getFaceEncryptionKey();
+  if (!encryptionKey) {
+    throw new FaceRecognitionError("Face verification is not configured.", 503);
+  }
+
+  try {
+    const decipher = crypto.createDecipheriv("aes-256-gcm", encryptionKey, nonce);
+    decipher.setAuthTag(authTag);
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  } catch (error) {
+    console.error("Stored face template could not be decrypted:", error);
+    throw new FaceRecognitionError("The enrolled face template is unavailable.", 503);
+  }
+}
+
+async function verifyFaceWithService(
+  imageBase64: string,
+  referenceEmbedding: Buffer
+): Promise<boolean> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${process.env.FACE_SERVICE_URL || "http://127.0.0.1:8001"}/face/verify`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image_base64: imageBase64,
+          reference_embedding_base64: referenceEmbedding.toString("base64"),
+        }),
+        signal: AbortSignal.timeout(15_000),
+      }
+    );
+  } catch {
+    throw new FaceRecognitionError("Facial verification service is unavailable.", 503);
+  }
+
+  const result = (await response.json().catch(() => ({}))) as {
+    verified?: boolean;
+    detail?: string;
+  };
+  if (!response.ok) {
+    throw new FaceRecognitionError(
+      result.detail || "The face capture could not be verified.",
+      [400, 413].includes(response.status) ? response.status : 503
+    );
+  }
+  if (typeof result.verified !== "boolean") {
+    throw new FaceRecognitionError("Facial verification returned an invalid response.", 503);
+  }
+  return result.verified;
+}
+
 function isUserOnline(userId: string): boolean {
   const sockets = userSockets.get(userId);
   return Boolean(sockets && sockets.size > 0);
@@ -292,7 +350,7 @@ app.post("/api/auth/register", async (req, res) => {
     const userAvatar =
       avatar ||
       "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23e9e7ff'/%3E%3Ccircle cx='50' cy='38' r='18' fill='%237269ef'/%3E%3Cpath d='M15 100c2-24 16-36 35-36s33 12 35 36' fill='%237269ef'/%3E%3C/svg%3E";
-    const userBio = bio?.trim() || "Hey there! I am using Chatvia.";
+    const userBio = bio?.trim() || "Hey there! I am using CryptChat.";
     const nonce = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey, nonce);
     const ciphertext = Buffer.concat([cipher.update(embedding), cipher.final()]);
@@ -633,7 +691,7 @@ app.get("/api/friends/:friendId/secure-key", requireJwt, async (req, res) => {
   const userId = res.locals.userId as string;
   try {
     const friendship = await pool.query(
-      `SELECT fr.id, fs.salt, fs.set_by, fs.confirmed_by
+      `SELECT fr.id, fs.salt, fs.set_by, fs.confirmed_by, fs.confirmed_at
        FROM friend_requests fr
        LEFT JOIN friendship_secrets fs ON fs.friendship_id = fr.id
        WHERE fr.status = 'accepted'
@@ -648,12 +706,13 @@ app.get("/api/friends/:friendId/secure-key", requireJwt, async (req, res) => {
     const key = friendship.rows[0];
     const configured = Boolean(key.set_by);
     const setByMe = key.set_by === userId;
-    const ready = configured && (setByMe || Boolean(key.confirmed_by));
+    const ready = configured && Boolean(key.confirmed_at);
     return res.json({
       configured,
       ready,
       setByMe,
       confirmedByMe: key.confirmed_by === userId,
+      confirmed: Boolean(key.confirmed_by),
       salt: configured ? Buffer.from(key.salt).toString("base64") : null,
     });
   } catch (err) {
@@ -702,10 +761,11 @@ app.put("/api/friends/:friendId/secure-key", requireJwt, async (req, res) => {
       );
       await client.query("COMMIT");
       return res.json({
-        ready: true,
+        ready: false,
         setByMe: true,
+        confirmed: false,
         salt: salt.toString("base64"),
-        message: "Shared passphrase saved. You can send secure messages now; your friend can confirm the same passphrase when ready.",
+        message: "Shared passphrase saved. Your friend must confirm it once before secure messaging is enabled.",
       });
     }
 
@@ -734,6 +794,7 @@ app.put("/api/friends/:friendId/secure-key", requireJwt, async (req, res) => {
     await client.query("COMMIT");
     return res.json({
       ready: true,
+      confirmed: true,
       salt: Buffer.from(stored.salt).toString("base64"),
       message: "Shared passphrase confirmed. Use it to encrypt and decrypt secure messages.",
     });
@@ -741,6 +802,133 @@ app.put("/api/friends/:friendId/secure-key", requireJwt, async (req, res) => {
     await client.query("ROLLBACK");
     console.error("Friendship key setup error:", err);
     return res.status(500).json({ error: "Failed to set up the shared passphrase." });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/friends/:friendId/secure-key/verify", requireJwt, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const secret = req.body.secret;
+  if (typeof secret !== "string" || secret.length < 12 || secret.length > 256) {
+    return res.status(400).json({ error: "Enter the shared passphrase for this friendship." });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT fs.salt, fs.secret_hash
+       FROM friend_requests fr
+       JOIN friendship_secrets fs ON fs.friendship_id = fr.id
+       WHERE fr.status = 'accepted'
+         AND fs.confirmed_at IS NOT NULL
+         AND ((fr.sender_id = $1 AND fr.receiver_id = $2)
+           OR (fr.sender_id = $2 AND fr.receiver_id = $1))`,
+      [userId, req.params.friendId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: "The shared passphrase is not ready for this friendship." });
+    }
+
+    const stored = result.rows[0];
+    const suppliedHash = await hashFriendshipSecret(secret, Buffer.from(stored.salt));
+    const matches = crypto.timingSafeEqual(suppliedHash, Buffer.from(stored.secret_hash));
+    return res.json({
+      valid: matches,
+      salt: matches ? Buffer.from(stored.salt).toString("base64") : undefined,
+    });
+  } catch (err) {
+    console.error("Friendship key verification error:", err);
+    return res.status(500).json({ error: "Failed to verify the shared passphrase." });
+  }
+});
+
+app.post("/api/friends/:friendId/secure-key/rotate", requireJwt, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const { currentSecret, newSecret } = req.body as {
+    currentSecret?: unknown;
+    newSecret?: unknown;
+  };
+  if (
+    typeof currentSecret !== "string" ||
+    currentSecret.length < 12 ||
+    currentSecret.length > 256 ||
+    typeof newSecret !== "string" ||
+    newSecret.trim().length < 12 ||
+    newSecret.length > 256
+  ) {
+    return res.status(400).json({ error: "Current and new passphrases must each be 12 to 256 characters." });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const friendship = await client.query(
+      `SELECT id FROM friend_requests
+       WHERE status = 'accepted'
+         AND ((sender_id = $1 AND receiver_id = $2)
+           OR (sender_id = $2 AND receiver_id = $1))
+       FOR UPDATE`,
+      [userId, req.params.friendId]
+    );
+    if (friendship.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Secure keys are available only to accepted friends." });
+    }
+
+    const friendshipId = friendship.rows[0].id as string;
+    const existing = await client.query(
+      `SELECT salt, secret_hash, confirmed_at
+       FROM friendship_secrets WHERE friendship_id = $1 FOR UPDATE`,
+      [friendshipId]
+    );
+    if (existing.rows.length === 0 || !existing.rows[0].confirmed_at) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Confirm the current shared passphrase before changing it." });
+    }
+
+    const stored = existing.rows[0];
+    const suppliedHash = await hashFriendshipSecret(currentSecret, Buffer.from(stored.salt));
+    if (!crypto.timingSafeEqual(suppliedHash, Buffer.from(stored.secret_hash))) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "The current passphrase is incorrect." });
+    }
+
+    const pendingMessages = await client.query(
+      `SELECT 1
+       FROM messages m
+       JOIN stego_messages sm ON sm.message_id = m.id AND sm.consumed_at IS NULL
+       WHERE m.is_secure = TRUE
+         AND ((m.sender_id = $1 AND m.receiver_id = $2)
+           OR (m.sender_id = $2 AND m.receiver_id = $1))
+       LIMIT 1`,
+      [userId, req.params.friendId]
+    );
+    if (pendingMessages.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "View or remove all pending private image messages before changing this key.",
+      });
+    }
+
+    const salt = crypto.randomBytes(16);
+    const secretHash = await hashFriendshipSecret(newSecret, salt);
+    await client.query(
+      `UPDATE friendship_secrets
+       SET salt = $2, secret_hash = $3, set_by = $4, confirmed_by = NULL,
+           confirmed_at = NULL
+       WHERE friendship_id = $1`,
+      [friendshipId, salt, secretHash, userId]
+    );
+    await client.query("COMMIT");
+    return res.json({
+      ready: false,
+      salt: salt.toString("base64"),
+      message: "New passphrase saved. Your friend must confirm it once before either of you can use it.",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Friendship key rotation error:", err);
+    return res.status(500).json({ error: "Failed to update the shared passphrase." });
   } finally {
     client.release();
   }
@@ -948,13 +1136,16 @@ app.get("/api/messages", async (req, res) => {
 
 app.post("/api/secure/messages", requireJwt, async (req, res) => {
   const senderId = res.locals.userId as string;
-  const { friendId, imageBase64, payloadBase64 } = req.body as {
+  const { friendId, keySalt, imageBase64, payloadBase64 } = req.body as {
     friendId?: string;
+    keySalt?: string;
     imageBase64?: string;
     payloadBase64?: string;
   };
   if (
     typeof friendId !== "string" ||
+    typeof keySalt !== "string" ||
+    !/^[A-Za-z0-9+/]{22}==$/.test(keySalt) ||
     typeof imageBase64 !== "string" ||
     typeof payloadBase64 !== "string" ||
     imageBase64.length > 11_200_000 ||
@@ -980,16 +1171,21 @@ app.post("/api/secure/messages", requireJwt, async (req, res) => {
 
   try {
     const friendshipRes = await pool.query(
-      `SELECT fr.id
+      `SELECT fr.id, fs.salt
        FROM friend_requests fr
        JOIN friendship_secrets fs ON fs.friendship_id = fr.id
        WHERE fr.status = 'accepted'
+         AND fs.confirmed_at IS NOT NULL
          AND ((fr.sender_id = $1 AND fr.receiver_id = $2)
            OR (fr.sender_id = $2 AND fr.receiver_id = $1))`,
       [senderId, friendId]
     );
     if (friendshipRes.rows.length === 0) {
       return res.status(403).json({ error: "Confirm the shared passphrase with this friend first." });
+    }
+    const friendshipId = friendshipRes.rows[0].id as string;
+    if (Buffer.from(friendshipRes.rows[0].salt).toString("base64") !== keySalt) {
+      return res.status(409).json({ error: "The friendship key changed. Refresh the chat before sending." });
     }
 
     const stegoImage = await callSteganographyService("embed", image, payload);
@@ -999,6 +1195,24 @@ app.post("/api/secure/messages", requireJwt, async (req, res) => {
     let message;
     try {
       await client.query("BEGIN");
+      const currentKey = await client.query(
+        `SELECT fs.salt, fs.confirmed_at
+         FROM friend_requests fr
+         JOIN friendship_secrets fs ON fs.friendship_id = fr.id
+         WHERE fr.id = $1 AND fr.status = 'accepted'
+         FOR UPDATE OF fr, fs`,
+        [friendshipId]
+      );
+      if (
+        currentKey.rows.length === 0 ||
+        !currentKey.rows[0].confirmed_at ||
+        Buffer.from(currentKey.rows[0].salt).toString("base64") !== keySalt
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "The friendship key changed. Refresh the chat and confirm the current key before sending.",
+        });
+      }
       await client.query(
         `INSERT INTO attachments (id, owner_id, file_name, content_type, file_data, file_size)
          VALUES ($1, $2, $3, 'image/png', $4, $5)`,
@@ -1069,6 +1283,61 @@ app.get("/api/secure/messages/:id/image", requireJwt, async (req, res) => {
   }
 });
 
+app.post("/api/secure/messages/:id/verify-face", requireJwt, async (req, res) => {
+  const receiverId = res.locals.userId as string;
+  const imageBase64 = req.body?.imageBase64;
+  if (
+    typeof imageBase64 !== "string" ||
+    imageBase64.length > 2_800_000 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(imageBase64)
+  ) {
+    return res.status(400).json({ error: "A valid camera capture is required." });
+  }
+
+  const image = Buffer.from(imageBase64, "base64");
+  if (
+    image.length === 0 ||
+    image.length > 2_000_000 ||
+    image.toString("base64") !== imageBase64
+  ) {
+    return res.status(400).json({ error: "The camera capture is invalid or too large." });
+  }
+
+  let template: Buffer | undefined;
+  try {
+    const templateResult = await pool.query(
+      `SELECT b.template_ciphertext, b.nonce, b.auth_tag
+       FROM messages m
+       JOIN face_biometrics b ON b.user_id = m.receiver_id
+       WHERE m.id = $1 AND m.receiver_id = $2 AND m.is_secure = TRUE`,
+      [req.params.id, receiverId]
+    );
+    if (templateResult.rows.length === 0) {
+      return res.status(403).json({ verified: false });
+    }
+
+    const stored = templateResult.rows[0];
+    template = decryptFaceTemplate(
+      Buffer.from(stored.template_ciphertext),
+      Buffer.from(stored.nonce),
+      Buffer.from(stored.auth_tag)
+    );
+    const verified = await verifyFaceWithService(imageBase64, template);
+    return res.json({ verified });
+  } catch (error) {
+    console.error("Secure message face verification error:", error);
+    const statusCode = error instanceof FaceRecognitionError ? error.statusCode : 500;
+    const message =
+      error instanceof FaceRecognitionError
+        ? error.message
+        : "Could not verify the recipient.";
+    return res.status(statusCode).json({ error: message });
+  } finally {
+    image.fill(0);
+    template?.fill(0);
+  }
+});
+
 app.post("/api/secure/messages/:id/payload", requireJwt, async (req, res) => {
   const receiverId = res.locals.userId as string;
   try {
@@ -1107,7 +1376,7 @@ app.post("/api/secure/messages/:id/consume", requireJwt, async (req, res) => {
   try {
     await client.query("BEGIN");
     const secureMessage = await client.query(
-      `SELECT sm.attachment_id, sm.original_png
+      `SELECT sm.attachment_id, sm.original_png, m.sender_id
        FROM messages m
        JOIN stego_messages sm ON sm.message_id = m.id AND sm.consumed_at IS NULL
        WHERE m.id = $1 AND m.receiver_id = $2 AND m.is_secure = TRUE
@@ -1131,6 +1400,10 @@ app.post("/api/secure/messages/:id/consume", requireJwt, async (req, res) => {
       [req.params.id]
     );
     await client.query("COMMIT");
+    broadcastToUser(secureMessage.rows[0].sender_id, {
+      type: "secure_message_consumed",
+      messageId: req.params.id,
+    });
     return res.json({ consumed: true });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -1183,8 +1456,25 @@ app.post("/api/messages", async (req, res) => {
 // ---------------- WEBSOCKET SERVER ----------------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
+const socketLiveness = new WeakMap<WebSocket, boolean>();
+
+const presenceHeartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (socketLiveness.get(socket) === false) {
+      socket.terminate();
+      continue;
+    }
+    socketLiveness.set(socket, false);
+    socket.ping();
+  }
+}, 30_000);
+
+wss.on("close", () => clearInterval(presenceHeartbeat));
 
 wss.on("connection", (ws, req) => {
+  socketLiveness.set(ws, true);
+  ws.on("pong", () => socketLiveness.set(ws, true));
+
   let userId: string | null = null;
   const authTimeout = setTimeout(() => ws.close(1008, "Authentication required"), 10_000);
 
@@ -1205,11 +1495,20 @@ wss.on("connection", (ws, req) => {
         }
         userId = payload.sub;
         clearTimeout(authTimeout);
+        const wasOnline = isUserOnline(userId);
         if (!userSockets.has(userId)) {
           userSockets.set(userId, new Set());
         }
         userSockets.get(userId)!.add(ws);
-        broadcastGlobal({ type: "user_status", userId, online: true });
+        ws.send(
+          JSON.stringify({
+            type: "presence_snapshot",
+            onlineUserIds: [...userSockets.keys()].filter((id) => id !== userId),
+          })
+        );
+        if (!wasOnline) {
+          broadcastGlobal({ type: "user_status", userId, online: true });
+        }
         return;
       }
 
@@ -1279,7 +1578,7 @@ wss.on("connection", (ws, req) => {
 initDatabase()
   .then(() => {
     server.listen(PORT, () => {
-      console.log(`Chatvia Server running on http://localhost:${PORT}`);
+      console.log(`CryptChat Server running on http://localhost:${PORT}`);
       console.log(`WebSocket running on ws://localhost:${PORT}/ws`);
     });
   })

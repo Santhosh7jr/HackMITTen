@@ -1,6 +1,6 @@
-# Chatvia - Real-Time Multi-User Chat Application
+# CryptChat - Real-Time Secure Messaging
 
-Chatvia is a real-time chat application built with React, TypeScript, Vite, Express, WebSockets, PostgreSQL, and a Python facial-enrollment service using OpenCV, NumPy, and InspireFace.
+CryptChat is a real-time messaging application built with React, TypeScript, Vite, Express, WebSockets, PostgreSQL, and a Python facial-recognition service using OpenCV, NumPy, and InspireFace.
 
 ## Features
 
@@ -10,9 +10,11 @@ Chatvia is a real-time chat application built with React, TypeScript, Vite, Expr
 - Real-time messaging and notifications are available to accepted friends.
 - Profiles can be edited after signing in.
 - Registration requires camera capture and explicit consent. InspireFace checks for exactly one face and creates a recognition template; the raw camera image is not stored. Enrollment is not liveness detection or identity verification.
+- Before a recipient can reveal a secure message, the app verifies one enrolled face and continues checking while the text is visible. If the check fails, the text is hidden and the one-time message remains consumed. Verification frames are processed by the configured face service and are not stored. This is not liveness detection and cannot detect people outside the camera view or prevent screenshots or recording.
 - Face templates are encrypted with AES-256-GCM before being stored in PostgreSQL. Keep `FACE_ENCRYPTION_KEY` secret and back it up securely; losing it makes stored templates unreadable.
-- Secure image messages use a per-friend shared passphrase, client-side AES-GCM encryption, and randomized PNG LSB steganography. PostgreSQL stores the stego image and the exact original PNG; after the recipient decrypts successfully, the stored image is restored and the saved original is cleared.
-- The shared passphrase is never stored in plaintext or placed in a JWT. PostgreSQL keeps a salted scrypt verifier; JWTs authenticate secure-message requests.
+- Secure image messages use one shared passphrase per friendship, client-side AES-GCM encryption, and randomized PNG LSB steganography. PostgreSQL stores only a salted verifier for the passphrase, plus the stego image and the exact original PNG. After the recipient decrypts successfully, the stored image is restored and the saved original is cleared.
+- The passphrase is entered once to set or confirm a friendship key. Each device stores the derived, non-exportable encryption key in IndexedDB and reuses it for later messages; the passphrase itself is never persisted in plaintext, sent in a JWT, or stored by the server. A new device or cleared browser storage requires unlocking the friendship key once again.
+- Friendship keys can be rotated from the dedicated **Keys** page. The other friend must confirm the new passphrase before secure messaging resumes. Rotation is blocked while any one-time private image message remains unopened.
 
 ## Run locally
 
@@ -67,6 +69,6 @@ npm run dev
 
 The frontend runs at `http://localhost:5173`. Create an account with **Sign Up** to get started. Signing out or refreshing the page requires signing in again; account and chat data remain in PostgreSQL.
 
-To send a secure image message, select **Secure image + text**, set a shared passphrase with a friend, and have the other friend confirm the same passphrase. Choose a PNG and enter the text; the encrypted payload is hidden in the PNG before it is saved. The recipient must enter the passphrase and select **Decrypt once**. A wrong passphrase does not consume the message. After a successful decrypt, the application restores the original PNG in PostgreSQL and removes the saved recovery copy.
+To send a secure image message, select **Private image message**, set one passphrase for the friendship, and have the other friend confirm it once. Each device saves the derived key so it is reused without prompting for every message. Choose a PNG and enter the text; the encrypted payload is hidden in the PNG before it is saved. The recipient selects the image's small decrypt control. A failed initial face check does not consume the message. After a successful decrypt, the app keeps the text visible only while the enrolled face remains alone in view; a failed check hides the text. The application restores the original PNG in PostgreSQL and removes the saved recovery copy.
 
 Restoration and removal are logical database operations, not a guarantee of forensic erasure: PostgreSQL write-ahead logs, replicas, or backups may retain earlier data until their retention policies expire.

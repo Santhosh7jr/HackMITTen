@@ -5,64 +5,68 @@
 :root {
   --font-family: 'Public Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 
-  /* Chatvia Theme Colors */
-  --primary-color: #7269ef;
-  --primary-hover: #6159cb;
-  --primary-light: rgba(114, 105, 239, 0.12);
-  --primary-border: rgba(114, 105, 239, 0.25);
+  /* CryptChat Theme Colors */
+  --primary-color: #0b8f82;
+  --primary-hover: #087569;
+  --primary-light: rgba(11, 143, 130, 0.11);
+  --primary-border: rgba(11, 143, 130, 0.24);
 
-  --bg-app: #f5f7fb;
+  --bg-app: #e8edef;
   --bg-sidebar: #ffffff;
-  --bg-chat: #ffffff;
-  --bg-input: #e6ebf5;
+  --bg-chat: #efeae2;
+  --bg-input: #f2f5f5;
   --bg-card: #ffffff;
   
   --nav-rail-bg: #ffffff;
-  --nav-rail-border: #f0f2f7;
+  --nav-rail-border: #e8eeee;
 
-  --border-color: #f0f2f7;
-  --border-light: #e6ebf5;
+  --border-color: #e8eeee;
+  --border-light: #edf1f1;
 
-  --text-primary: #343a40;
-  --text-secondary: #7a7f9a;
-  --text-muted: #abb4d2;
+  --text-primary: #233138;
+  --text-secondary: #667780;
+  --text-muted: #9aa8ad;
   
-  --bubble-received-bg: #f5f7fb;
-  --bubble-received-text: #343a40;
-  --bubble-sent-bg: #7269ef;
-  --bubble-sent-text: #ffffff;
+  --bubble-received-bg: #ffffff;
+  --bubble-received-text: #233138;
+  --bubble-sent-bg: #d9fdd3;
+  --bubble-sent-text: #233138;
 
-  --badge-online: #06d6a0;
+  --badge-online: #20c56b;
   --badge-offline: #a0aec0;
   --badge-danger: #ef476f;
   --badge-warning: #ffd166;
 
-  --shadow-sm: 0 2px 4px rgba(15, 34, 58, 0.06);
-  --shadow-md: 0 4px 12px rgba(15, 34, 58, 0.08);
-  --shadow-lg: 0 10px 25px rgba(15, 34, 58, 0.12);
+  --shadow-sm: 0 1px 3px rgba(20, 42, 48, 0.08);
+  --shadow-md: 0 6px 18px rgba(20, 42, 48, 0.1);
+  --shadow-lg: 0 18px 48px rgba(10, 25, 30, 0.2);
 }
 
 /* Dark Mode Variables */
 [data-theme='dark'] {
-  --bg-app: #262e35;
-  --bg-sidebar: #303841;
-  --bg-chat: #262e35;
-  --bg-input: #36404a;
-  --bg-card: #303841;
+  --primary-color: #28b8a5;
+  --primary-hover: #41c8b6;
+  --primary-light: rgba(40, 184, 165, 0.14);
+  --primary-border: rgba(40, 184, 165, 0.28);
+  --bg-app: #10191d;
+  --bg-sidebar: #172126;
+  --bg-chat: #0b141a;
+  --bg-input: #202c33;
+  --bg-card: #182229;
 
-  --nav-rail-bg: #36404a;
-  --nav-rail-border: #3b4550;
+  --nav-rail-bg: #172126;
+  --nav-rail-border: #26343a;
 
-  --border-color: #36404a;
-  --border-light: #3e4853;
+  --border-color: #26343a;
+  --border-light: #29383e;
 
-  --text-primary: #eff2f7;
-  --text-secondary: #abb4d2;
-  --text-muted: #7a7f9a;
+  --text-primary: #e9edef;
+  --text-secondary: #aebac1;
+  --text-muted: #738188;
 
-  --bubble-received-bg: #36404a;
-  --bubble-received-text: #eff2f7;
-  --bubble-sent-bg: #7269ef;
+  --bubble-received-bg: #202c33;
+  --bubble-received-text: #e9edef;
+  --bubble-sent-bg: #005c4b;
   --bubble-sent-text: #ffffff;
 }
 
