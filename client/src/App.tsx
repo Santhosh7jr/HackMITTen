@@ -197,6 +197,7 @@ async function verifySecureViewer(
       },
       body: JSON.stringify({ imageBase64 }),
       cache: 'no-store',
+      signal: AbortSignal.timeout(2000),
     }
   );
   const data = await response.json();
@@ -308,12 +309,17 @@ function ChatViewPanel({
   const [secureImage, setSecureImage] = useState<File | null>(null);
   const [secureImageUrls, setSecureImageUrls] = useState<Record<string, string>>({});
   const [revealedSecureMessages, setRevealedSecureMessages] = useState<Record<string, string>>({});
+  const [secureRevealWarning, setSecureRevealWarning] = useState<{
+    messageId: string;
+    text: string;
+  } | null>(null);
   const [secureProcessingId, setSecureProcessingId] = useState<string | null>(null);
   const [activeSecureRevealId, setActiveSecureRevealId] = useState<string | null>(null);
   const [secureCameraStream, setSecureCameraStream] = useState<MediaStream | null>(null);
   const secureImageInputRef = useRef<HTMLInputElement | null>(null);
   const secureCameraStreamRef = useRef<MediaStream | null>(null);
   const secureCameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const secureRevealWarningTimeoutRef = useRef<number | null>(null);
   const activeContactRef = useRef<User | null>(activeContact);
 
   // Typing
@@ -337,9 +343,25 @@ function ChatViewPanel({
     setSecureCameraStream(null);
   }, []);
 
+  const showSecureRevealWarning = useCallback((messageId: string, text: string) => {
+    if (secureRevealWarningTimeoutRef.current !== null) {
+      window.clearTimeout(secureRevealWarningTimeoutRef.current);
+    }
+    setSecureRevealWarning({ messageId, text });
+    secureRevealWarningTimeoutRef.current = window.setTimeout(() => {
+      setSecureRevealWarning(null);
+      secureRevealWarningTimeoutRef.current = null;
+    }, 6000);
+  }, []);
+
   const clearSecureReveal = useCallback(() => {
     setRevealedSecureMessages({});
     setActiveSecureRevealId(null);
+    setSecureRevealWarning(null);
+    if (secureRevealWarningTimeoutRef.current !== null) {
+      window.clearTimeout(secureRevealWarningTimeoutRef.current);
+      secureRevealWarningTimeoutRef.current = null;
+    }
     stopSecureCamera();
   }, [stopSecureCamera]);
 
@@ -411,6 +433,9 @@ function ChatViewPanel({
   useEffect(() => () => {
     secureCameraStreamRef.current?.getTracks().forEach((track) => track.stop());
     secureCameraStreamRef.current = null;
+    if (secureRevealWarningTimeoutRef.current !== null) {
+      window.clearTimeout(secureRevealWarningTimeoutRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -418,7 +443,7 @@ function ChatViewPanel({
 
     let stopped = false;
     let nextCheck: number | undefined;
-    const concealMessage = () => {
+    const concealMessage = (warning?: string) => {
       if (stopped) return;
       stopped = true;
       if (nextCheck !== undefined) window.clearTimeout(nextCheck);
@@ -427,6 +452,7 @@ function ChatViewPanel({
         delete remaining[activeSecureRevealId];
         return remaining;
       });
+      if (warning) showSecureRevealWarning(activeSecureRevealId, warning);
       setActiveSecureRevealId(null);
       if (secureCameraStreamRef.current === secureCameraStream) {
         secureCameraStreamRef.current = null;
@@ -443,33 +469,38 @@ function ChatViewPanel({
 
       try {
         if (!(await verifySecureViewer(activeSecureRevealId, secureCameraStream, accessToken))) {
-          concealMessage();
+          concealMessage('Face check failed or multiple people were detected. Private text hidden.');
           return;
         }
       } catch (error) {
         console.error('Secure message face check failed:', error);
-        concealMessage();
+        concealMessage('Face verification could not continue. Private text hidden.');
         return;
       }
 
-      if (!stopped) nextCheck = window.setTimeout(checkViewer, 1000);
+      if (!stopped) nextCheck = window.setTimeout(checkViewer, 400);
     };
 
     const handleVisibilityChange = () => {
-      if (document.visibilityState !== 'visible') concealMessage();
+      if (document.visibilityState !== 'visible') {
+        concealMessage('Private text hidden when this page lost focus.');
+      }
     };
     const videoTrack = secureCameraStream.getVideoTracks()[0];
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    videoTrack?.addEventListener('ended', concealMessage);
+    const handleTrackEnded = () => {
+      concealMessage('Camera verification stopped. Private text hidden.');
+    };
+    videoTrack?.addEventListener('ended', handleTrackEnded);
     void checkViewer();
 
     return () => {
       stopped = true;
       if (nextCheck !== undefined) window.clearTimeout(nextCheck);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      videoTrack?.removeEventListener('ended', concealMessage);
+      videoTrack?.removeEventListener('ended', handleTrackEnded);
     };
-  }, [activeSecureRevealId, secureCameraStream, accessToken]);
+  }, [activeSecureRevealId, secureCameraStream, accessToken, showSecureRevealWarning]);
 
   useEffect(() => {
     if (!imagePreview) return;
@@ -1145,10 +1176,12 @@ function ChatViewPanel({
       return;
     }
 
+    clearSecureReveal();
     setSecureProcessingId(message.id);
     setUploadError('');
     let stream: MediaStream | null = null;
     let revealStarted = false;
+    let faceVerificationFailed = false;
     let combined: Uint8Array | undefined;
     let plaintext: Uint8Array | undefined;
     try {
@@ -1163,6 +1196,7 @@ function ChatViewPanel({
       secureCameraStreamRef.current = captureStream;
       setSecureCameraStream(captureStream);
       if (!(await verifySecureViewer(message.id, captureStream, accessToken))) {
+        faceVerificationFailed = true;
         throw new Error('Face check failed. The message remains unopened.');
       }
 
@@ -1196,6 +1230,7 @@ function ChatViewPanel({
       const text = new TextDecoder('utf-8', { fatal: true }).decode(plaintext);
 
       if (!(await verifySecureViewer(message.id, captureStream, accessToken))) {
+        faceVerificationFailed = true;
         throw new Error('Face check failed. The message remains unopened.');
       }
 
@@ -1228,6 +1263,12 @@ function ChatViewPanel({
       revealStarted = true;
     } catch (err) {
       console.error('Secure message decryption error:', err);
+      if (faceVerificationFailed) {
+        showSecureRevealWarning(
+          message.id,
+          'Face check failed or multiple people were detected. Private text was not opened.'
+        );
+      }
       const wrongPassphrase =
         err instanceof DOMException && err.name === 'OperationError';
       setUploadError(
@@ -2009,6 +2050,11 @@ function ChatViewPanel({
                               ) : (
                                 <span className="image-loading-state">Loading image…</span>
                               )}
+                              {secureRevealWarning?.messageId === m.id && (
+                                <div className="secure-reveal-warning" role="alert">
+                                  {secureRevealWarning.text}
+                                </div>
+                              )}
                               {revealedSecureMessages[m.id] ? (
                                 <div className="secure-message-revealed">
                                   {activeSecureRevealId === m.id && secureCameraStream && (
@@ -2196,12 +2242,9 @@ function ChatViewPanel({
               >
                 <button
                   type="button"
-                  className={`inline-flex w-full items-center justify-between rounded-xl border px-4 py-3 text-left text-sm font-semibold shadow-sm transition sm:w-auto ${
-                    secureMode
-                      ? 'border-emerald-700 bg-emerald-700 text-white hover:bg-emerald-800'
-                      : 'border-[var(--border-color)] bg-[var(--bg-card)] text-[var(--text-primary)] hover:border-emerald-500'
-                  }`}
+                  className={`secure-mode-toggle${secureMode ? ' active' : ''}`}
                   aria-pressed={secureMode}
+                  title="Toggle private image message"
                   onClick={() => {
                     setSecureMode((enabled) => !enabled);
                     setSecureImage(null);
@@ -2209,12 +2252,7 @@ function ChatViewPanel({
                     if (secureImageInputRef.current) secureImageInputRef.current.value = '';
                   }}
                 >
-                  <span>{secureMode ? 'Private image message' : 'Send a private image message'}</span>
-                  <span className={`ml-4 rounded-full px-2 py-0.5 text-xs ${
-                    secureMode ? 'bg-white/20 text-white' : 'bg-[var(--bg-input)] text-[var(--text-secondary)]'
-                  }`}>
-                    {secureMode ? 'ON' : 'OFF'}
-                  </span>
+                  🔒 Private image
                 </button>
                 {secureMode && (
                   <section className="secure-key-card w-full rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 to-teal-50 p-4 text-slate-800 shadow-sm dark:border-emerald-400/30 dark:from-slate-800 dark:to-slate-900 dark:text-slate-100 sm:p-5">

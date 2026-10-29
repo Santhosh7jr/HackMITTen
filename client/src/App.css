@@ -926,6 +926,15 @@
   border-top: 1px solid var(--border-color);
 }
 
+.secure-reveal-warning {
+  padding: 10px 12px;
+  border-top: 1px solid rgba(239, 71, 111, 0.28);
+  background: rgba(239, 71, 111, 0.1);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .secure-message-revealed p {
   margin: 8px 0 0;
   white-space: pre-wrap;
@@ -1203,6 +1212,28 @@
   align-items: center;
   gap: 12px;
   position: relative;
+}
+
+.secure-mode-toggle {
+  padding: 4px 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.secure-mode-toggle:hover,
+.secure-mode-toggle.active {
+  color: var(--primary-color);
+}
+
+.secure-mode-toggle:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 3px;
+  border-radius: 4px;
 }
 
 .input-container-pill {
